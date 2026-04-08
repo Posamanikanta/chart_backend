@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Chat Room</title>
+    <style>
+        #chat-log { height: 300px; border: 1px solid #ddd; overflow-y: scroll; padding: 10px; margin-bottom: 10px; }
+        .msg { margin-bottom: 5px; }
+        .me { color: blue; }
+        .them { color: green; }
+    </style>
+</head>
+<body>
+    <h3>Chatting with User ID: {{ other_user_id }}</h3>
+    <div id="chat-log"></div>
+    <input id="chat-message-input" type="text" placeholder="Type message...">
+    <button id="chat-message-submit">Send</button>
+
+    <script>
+    const otherId = "{{ other_user_id }}"; 
+    const ws_scheme = window.location.protocol === "https:" ? "wss" : "ws";
+    const socket = new WebSocket(
+        `${ws_scheme}://${window.location.host}/ws/chat/${otherId}/`
+    );
+
+    // 1. Connection logic
+    socket.onopen = function(e) {
+        console.log("Successfully connected to the WebSocket!");
+    };
+
+    // 2. RECEIVE Logic: What happens when a message arrives?
+    socket.onmessage = function(e) {
+        const data = JSON.parse(e.data);
+        console.log("Message received:", data);
+        
+        const chatLog = document.querySelector('#chat-log');
+        const messageDiv = document.createElement('div');
+        messageDiv.className = 'msg';
+        messageDiv.innerHTML = `<strong>${data.sender}:</strong> ${data.message}`;
+        
+        chatLog.appendChild(messageDiv);
+        
+        // Auto-scroll to the bottom
+        chatLog.scrollTop = chatLog.scrollHeight;
+    };
+
+    // 3. SEND Logic: What happens when you click 'Send'?
+    document.querySelector('#chat-message-submit').onclick = function(e) {
+        const messageInput = document.querySelector('#chat-message-input');
+        const message = messageInput.value;
+
+        if (message.trim() !== "") {
+            // Send as JSON string
+            socket.send(JSON.stringify({
+                'message': message
+            }));
+            messageInput.value = ''; // Clear input
+        }
+    };
+
+    // Optional: Allow pressing "Enter" to send
+    document.querySelector('#chat-message-input').onkeyup = function(e) {
+        if (e.keyCode === 13) { 
+            document.querySelector('#chat-message-submit').click();
+        }
+    };
+
+    socket.onclose = function(e) {
+        console.error("Chat socket closed unexpectedly.");
+    };
+</script>
+</body>
+</html>
