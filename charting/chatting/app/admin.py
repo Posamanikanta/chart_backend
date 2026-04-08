@@ -1,32 +1,53 @@
+# app/admin.py
 from django.contrib import admin
-from .models import Message, ChatGroup, UserProfile
+from .models import Employee, ChatGroup, Message
 
-# 1. Manage User Profiles (Roles like Admin/Employee)
-@admin.register(UserProfile)
-class UserProfileAdmin(admin.ModelAdmin):
-    list_display = ('user', 'role')
-    list_filter = ('role',)
-    search_fields = ('user__username',)
 
-# 2. Manage Chat Groups
+@admin.register(Employee)
+class EmployeeAdmin(admin.ModelAdmin):
+    """Admin panel for Employee with visible password"""
+    list_display = ('id', 'name', 'email', 'password', 'role', 'is_active', 'created_at')
+    list_filter = ('role', 'is_active', 'created_at')
+    search_fields = ('name', 'email')
+    list_editable = ('is_active',)
+    ordering = ('-created_at',)
+    
+    fieldsets = (
+        ('Personal Information', {
+            'fields': ('name', 'email', 'password', 'role')
+        }),
+        ('Status', {
+            'fields': ('is_active',)
+        }),
+        ('System Link', {
+            'fields': ('user',),
+            'classes': ('collapse',)
+        }),
+    )
+    
+    readonly_fields = ('created_at',)
+
+
 @admin.register(ChatGroup)
 class ChatGroupAdmin(admin.ModelAdmin):
-    list_display = ('name', 'created_by')
-    # This makes it easy to add/remove members in the admin panel
-    filter_horizontal = ('members',) 
+    """Admin panel for Chat Groups"""
+    list_display = ('id', 'name', 'created_by', 'member_count', 'created_at')
+    filter_horizontal = ('members',)
     search_fields = ('name',)
+    
+    def member_count(self, obj):
+        return obj.members.count()
+    member_count.short_description = 'Total Members'
 
-# 3. Manage Messages (The most important for moderation)
+
 @admin.register(Message)
 class MessageAdmin(admin.ModelAdmin):
-    # Shows these columns in the list view
-    list_display = ('sender', 'receiver', 'group', 'content_preview', 'timestamp')
-    # Adds a sidebar to filter by date or sender
-    list_filter = ('timestamp', 'sender')
-    # Allows you to search for specific text in messages
-    search_fields = ('content', 'sender__username')
-
-    # This helper function prevents long messages from stretching the table
+    """Admin panel for Messages"""
+    list_display = ('id', 'sender', 'receiver', 'group', 'content_preview', 'is_read', 'timestamp')
+    list_filter = ('timestamp', 'is_read', 'sender')
+    search_fields = ('content', 'sender__name', 'sender__email')
+    list_editable = ('is_read',)
+    
     def content_preview(self, obj):
         return obj.content[:50] + "..." if len(obj.content) > 50 else obj.content
     content_preview.short_description = 'Message Content'
