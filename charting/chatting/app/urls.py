@@ -1,4 +1,3 @@
-# app/urls.py - COMPLETE
 from django.urls import path
 from . import views
 
@@ -57,4 +56,10 @@ urlpatterns = [
     path('api/admin/employee/<int:employee_id>/groups/<int:group_id>/messages/', views.admin_view_employee_group_messages, name='admin_view_employee_group_messages'),
     path('api/admin/activity-log/', views.admin_get_activity_log, name='admin_get_activity_log'),
     path('api/admin/exit-employee-view/', views.admin_exit_employee_view, name='admin_exit_employee_view'),
+    
+path('api/messages/<int:message_id>/star/', views.toggle_message_star, name='toggle_message_star'),
+path('api/messages/<int:message_id>/pin/', views.toggle_message_pin, name='toggle_message_pin'),
+path('api/users/<int:target_id>/block/', views.toggle_block_user, name='toggle_block_user'),
+path('api/messages/forward/', views.forward_messages, name='forward_messages'),
+path('api/admin/employee/<int:employee_id>/delete/', views.admin_delete_employee, name='admin_delete_employee'),
 ]

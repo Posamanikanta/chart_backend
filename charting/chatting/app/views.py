@@ -1,204 +1,141 @@
-# app/views.py - COMPLETE
-from django.db.models import Q, Count, Max, Subquery, OuterRef, F
-from django.views.decorators.csrf import csrf_exempt
+import os
+import logging
+import mimetypes
+from datetime import timedelta
+from django.db.models import Q, Count, Max
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.models import User
 from django.utils import timezone
+from django.views.decorators.csrf import ensure_csrf_cookie
 from rest_framework.decorators import api_view, permission_classes, parser_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.response import Response
 from .models import (
-    Employee, Message, ChatGroup, MessageReaction, 
+    Employee, Message, ChatGroup, MessageReaction,
     MessageDeletion, SavedMeetLink, MeetingInvitation, AdminActivityLog
 )
-import os
-import mimetypes
+
+logger = logging.getLogger(__name__)
 
 
 # ==================== HELPER FUNCTIONS ====================
 
 def log_admin_activity(admin, action, target_employee=None, details=None):
-    """Helper function to log admin activities"""
-    AdminActivityLog.objects.create(
-        admin=admin,
-        action=action,
-        target_employee=target_employee,
-        details=details or {}
-    )
+    details = details or {}
+    recent_cutoff = timezone.now() - timedelta(seconds=5)
+    
+    existing = AdminActivityLog.objects.filter(
+        admin=admin, action=action, target_employee=target_employee, timestamp__gte=recent_cutoff
+    ).exists()
+    
+    if existing: return None
+    
+    log = AdminActivityLog.objects.create(admin=admin, action=action, target_employee=target_employee, details=details)
+    return log
 
 
 def serialize_message(msg, current_employee, viewing_as_admin=False, target_employee=None):
-    """
-    Helper to serialize a message with reactions, edit status, and deletion status
-    viewing_as_admin: True when admin is viewing another employee's messages
-    target_employee: The employee whose perspective we're viewing from
-    """
-    
-    # Determine perspective employee (who's "me")
     perspective_employee = target_employee if viewing_as_admin and target_employee else current_employee
     
-    # Check if deleted for this user
-    is_deleted_for_me = MessageDeletion.objects.filter(
-        message=msg,
-        employee=perspective_employee
-    ).exists()
-    
-    if is_deleted_for_me and not viewing_as_admin:
-        return None  # Don't include in response unless admin is viewing
+    is_deleted_for_me = MessageDeletion.objects.filter(message=msg, employee=perspective_employee).exists()
+    if is_deleted_for_me and not viewing_as_admin: return None
     
     reactions = list(msg.reactions.values('reaction').annotate(count=Count('reaction')))
     user_reaction = msg.reactions.filter(employee=perspective_employee).first()
-    
-    # Check edit/delete permissions from perspective of target employee
-    can_edit = msg.can_edit(perspective_employee)
-    can_delete_for_everyone = msg.can_delete_for_everyone(perspective_employee)
     is_mine = msg.sender == perspective_employee
+    is_starred = msg.starred_by.filter(id=perspective_employee.id).exists()
     
-    # Handle deleted for everyone
+    reply_to_data = None
+    if msg.reply_to and not msg.reply_to.is_deleted_for_everyone and not msg.is_thread_reply:
+        reply_to_data = {
+            "id": msg.reply_to.id,
+            "text": msg.reply_to.content[:100] if msg.reply_to.content else "",
+            "sender_name": msg.reply_to.sender.name
+        }
+        
+    # ✅ LOAD PERMANENT THREADS
+    thread_replies = msg.replies.filter(is_thread_reply=True).order_by('timestamp')
+    thread_data = []
+    for tr in thread_replies:
+        if not tr.is_deleted_for_everyone:
+            thread_data.append({
+                "id": tr.id, "text": tr.content, "sender": "me" if tr.sender == perspective_employee else "them",
+                "senderName": tr.sender.name, "createdAt": tr.timestamp.isoformat()
+            })
+    
     if msg.is_deleted_for_everyone:
         return {
-            "id": msg.id,
-            "text": "🚫 This message was deleted",
-            "sender": "me" if is_mine else "them",
-            "sender_id": msg.sender.id,
-            "sender_name": msg.sender.name,
-            "sender_avatar": msg.sender.get_avatar_url(),
-            "receiver_id": msg.receiver.id if msg.receiver else None,
-            "createdAt": msg.timestamp.isoformat(),
-            "isRead": msg.is_read,
-            "messageType": "text",
-            "isDeleted": True,
-            "deletedForEveryone": True,
-            "isDeletedForMe": is_deleted_for_me,
+            "id": msg.id, "text": "🚫 This message was deleted", "sender": "me" if is_mine else "them",
+            "sender_id": msg.sender.id, "sender_name": msg.sender.name, "createdAt": msg.timestamp.isoformat(),
+            "messageType": "text", "isDeleted": True, "deletedForEveryone": True,
         }
     
     data = {
-        "id": msg.id,
-        "text": msg.content,
-        "sender": "me" if is_mine else "them",
-        "sender_id": msg.sender.id,
-        "sender_name": msg.sender.name,
-        "sender_avatar": msg.sender.get_avatar_url(),
-        "receiver_id": msg.receiver.id if msg.receiver else None,
-        "createdAt": msg.timestamp.isoformat(),
-        "isRead": msg.is_read,
-        "messageType": msg.message_type,
-        "fileUrl": msg.get_file_url(),
-        "fileName": msg.file_name,
-        "fileSize": msg.file_size,
+        "id": msg.id, "text": msg.content, "sender": "me" if is_mine else "them",
+        "sender_id": msg.sender.id, "sender_name": msg.sender.name, "sender_avatar": msg.sender.get_avatar_url(),
+        "receiver_id": msg.receiver.id if msg.receiver else None, "createdAt": msg.timestamp.isoformat(),
+        "isRead": msg.is_read, "messageType": msg.message_type, "fileUrl": msg.get_file_url(),
+        "fileName": msg.file_name, "fileSize": msg.file_size,
         "reactions": {r['reaction']: r['count'] for r in reactions},
         "userReaction": user_reaction.reaction if user_reaction else None,
-        "isEdited": msg.is_edited,
-        "editedAt": msg.edited_at.isoformat() if msg.edited_at else None,
-        "canEdit": can_edit and not viewing_as_admin,
-        "canDeleteForEveryone": can_delete_for_everyone and not viewing_as_admin,
-        "isMine": is_mine,
-        "isDeleted": False,
-        "isDeletedForMe": is_deleted_for_me,
+        "isEdited": msg.is_edited, "isMine": is_mine, "replyTo": reply_to_data,
+        "isPinned": msg.is_pinned, "isStarred": is_starred, 
+        "thread": thread_data, # ✅ Add thread array
     }
     
-    # Add meet info if applicable
     if msg.message_type == 'meet' and msg.meet_link:
-        invitations = list(msg.invitations.all())
-        my_invitation = next((inv for inv in invitations if inv.invitee == perspective_employee), None)
-        
         data["meetLink"] = msg.meet_link
         data["meetTitle"] = msg.meet_title
         data["meetScheduledAt"] = msg.meet_scheduled_at.isoformat() if msg.meet_scheduled_at else None
-        data["invitations"] = [{
-            "inviteeId": inv.invitee.id,
-            "inviteeName": inv.invitee.name,
-            "status": inv.status
-        } for inv in invitations]
-        data["myInviteStatus"] = my_invitation.status if my_invitation else None
     
     return data
-
-
 # ==================== AUTH VIEWS ====================
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+@ensure_csrf_cookie
+def get_csrf_token(request):
+    return Response({"detail": "CSRF cookie set"})
+
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
-@csrf_exempt
 def login_user(request):
-    """Login endpoint - creates Django session"""
     email = request.data.get('email', '').strip()
     password = request.data.get('password', '').strip()
     
-    print(f"\n🔐 Login attempt: {email}")
+    if not email or not password: return Response({"error": "Email and password required"}, status=400)
     
-    if not email or not password:
-        return Response({"error": "Email and password required"}, status=400)
+    try: employee = Employee.objects.get(email=email, is_active=True)
+    except Employee.DoesNotExist: return Response({"error": "Invalid email or password"}, status=401)
     
     try:
-        employee = Employee.objects.get(email=email, password=password, is_active=True)
-    except Employee.DoesNotExist:
-        print(f"❌ Invalid credentials for: {email}")
-        return Response({"error": "Invalid email or password"}, status=401)
-    
-    user, created = User.objects.get_or_create(
-        username=email,
-        defaults={
-            'email': email,
-            'first_name': employee.name,
-            'is_active': True
-        }
-    )
-    
-    if created:
+        user = User.objects.get(username=email)
         user.set_password(password)
         user.save()
-        print(f"✅ Created new User: {email}")
-    
-    if not employee.user:
+    except User.DoesNotExist:
+        user = User.objects.create_user(username=email, email=email, password=password, first_name=employee.name, is_active=True)
         employee.user = user
         employee.save()
-        print(f"✅ Linked Employee to User")
     
     auth_user = authenticate(request, username=email, password=password)
+    if auth_user is None or not auth_user.is_active: return Response({"error": "Invalid email or password"}, status=401)
     
-    if auth_user is None:
-        user.set_password(password)
-        user.save()
-        auth_user = authenticate(request, username=email, password=password)
+    login(request, auth_user)
+    request.session.save()
     
-    if auth_user and auth_user.is_active:
-        login(request, auth_user)
-        request.session.save()
-        
-        session_key = request.session.session_key
-        print(f"✅ User logged in: {email}")
-        print(f"✅ Session Key: {session_key}")
-        
-        response = Response({
-            "id": employee.id,
-            "name": employee.name,
-            "email": employee.email,
-            "role": employee.role,
-            "about": employee.about,
-            "avatarUrl": employee.get_avatar_url(),
-        }, status=200)
-        
-        response.set_cookie(
-            key='sessionid',
-            value=session_key,
-            max_age=86400,
-            httponly=False,
-            samesite=None,
-            secure=False,
-        )
-        
-        return response
-    else:
-        print(f"❌ Authentication failed for: {email}")
-        return Response({"error": "Authentication failed"}, status=401)
+    return Response({
+        "id": employee.id, "name": employee.name, "email": employee.email,
+        "role": employee.role, "about": employee.about, "status": employee.status,
+        "avatarUrl": employee.get_avatar_url(),
+        "is_suspended": employee.is_suspended, # ✅ Ensures frontend knows if they are suspended
+    }, status=200)
 
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def logout_user(request):
-    """Logout endpoint"""
     logout(request)
     return Response({"message": "Logged out successfully"}, status=200)
 
@@ -206,16 +143,13 @@ def logout_user(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_current_user(request):
-    """Get current authenticated user"""
     try:
         employee = Employee.objects.get(user=request.user, is_active=True)
         return Response({
-            "id": employee.id,
-            "name": employee.name,
-            "email": employee.email,
-            "role": employee.role,
-            "about": employee.about,
+            "id": employee.id, "name": employee.name, "email": employee.email,
+            "role": employee.role, "about": employee.about, "status": employee.status,
             "avatarUrl": employee.get_avatar_url(),
+            "is_suspended": employee.is_suspended, # ✅ Crucial for global ban
         }, status=200)
     except Employee.DoesNotExist:
         return Response({"error": "Employee not found"}, status=404)
@@ -226,13 +160,10 @@ def get_current_user(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_users(request):
-    """Get list of all active employees with last message and unread count"""
-    print(f"\n🔍 /api/users/ Request")
-    print(f"   User: {request.user.username}")
-    
     try:
         current_employee = Employee.objects.get(user=request.user, is_active=True)
         employees = Employee.objects.filter(is_active=True).exclude(id=current_employee.id)
+        blocked_ids = current_employee.blocked_users.values_list('id', flat=True)
         
         data = []
         for emp in employees:
@@ -243,22 +174,13 @@ def get_users(request):
                 )
             ).order_by('-timestamp').first()
             
-            unread_count = Message.objects.filter(
-                sender=emp,
-                receiver=current_employee,
-                is_read=False,
-                group__isnull=True
-            ).count()
+            unread_count = Message.objects.filter(sender=emp, receiver=current_employee, is_read=False, group__isnull=True).count()
             
             emp_data = {
-                "id": emp.id,
-                "name": emp.name,
-                "email": emp.email,
-                "role": emp.role,
-                "about": emp.about,
-                "avatarUrl": emp.get_avatar_url(),
-                "lastMessage": None,
-                "unreadCount": unread_count,
+                "id": emp.id, "name": emp.name, "email": emp.email, "role": emp.role, "about": emp.about,
+                "status": emp.status, "avatarUrl": emp.get_avatar_url(), "lastMessage": None, "unreadCount": unread_count,
+                "blocked": emp.id in blocked_ids,
+                "adminBlocked": emp.is_suspended, # ✅ Global Block
             }
             
             if last_message:
@@ -267,34 +189,14 @@ def get_users(request):
                     "text": last_message.content if last_message.content else f"[{last_message.message_type}]",
                     "sender": "me" if last_message.sender == current_employee else "them",
                     "createdAt": last_message.timestamp.isoformat(),
-                    "isRead": last_message.is_read,
-                    "messageType": last_message.message_type,
+                    "isRead": last_message.is_read, "messageType": last_message.message_type,
                 }
-            
             data.append(emp_data)
         
-        data.sort(
-            key=lambda x: x['lastMessage']['createdAt'] if x['lastMessage'] else '1970-01-01',
-            reverse=True
-        )
-        
-        print(f"✅ Returning {len(data)} employees with messages")
+        data.sort(key=lambda x: x['lastMessage']['createdAt'] if x['lastMessage'] else '1970-01-01', reverse=True)
         return Response(data, status=200)
-        
     except Employee.DoesNotExist:
-        print("⚠️ Employee not found for user, returning all")
-        employees = Employee.objects.filter(is_active=True)
-        data = [{
-            "id": e.id,
-            "name": e.name,
-            "email": e.email,
-            "role": e.role,
-            "avatarUrl": e.get_avatar_url(),
-            "lastMessage": None,
-            "unreadCount": 0,
-        } for e in employees]
-        return Response(data, status=200)
-
+        return Response({"error": "Employee not found"}, status=404)
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
@@ -316,8 +218,8 @@ def create_employee(request):
     if not email or not password or not name:
         return Response({"error": "Name, email and password are required"}, status=400)
     
-    if len(password) < 8:
-        return Response({"error": "Password must be at least 8 characters"}, status=400)
+    if len(password) < 6:
+        return Response({"error": "Password must be at least 6 characters"}, status=400)
     
     if Employee.objects.filter(email=email).exists():
         return Response({"error": "Employee with this email already exists"}, status=400)
@@ -334,7 +236,6 @@ def create_employee(request):
         employee = Employee.objects.create(
             name=name,
             email=email,
-            password=password,
             role=role,
             user=user,
             is_active=True
@@ -351,7 +252,7 @@ def create_employee(request):
     except Exception as e:
         if 'user' in locals():
             user.delete()
-        print(f"❌ Create Employee Error: {str(e)}")
+        logger.exception(f"Create Employee Error: {str(e)}")
         return Response({"error": str(e)}, status=400)
 
 
@@ -360,12 +261,13 @@ def create_employee(request):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def update_profile(request):
-    """Update user profile (name, about)"""
+    """Update user profile"""
     try:
         employee = Employee.objects.get(user=request.user, is_active=True)
         
         name = request.data.get('name', '').strip()
         about = request.data.get('about', '').strip()
+        status = request.data.get('status', '').strip()
         
         if name:
             employee.name = name
@@ -375,6 +277,9 @@ def update_profile(request):
         if about is not None:
             employee.about = about
         
+        if status in ['available', 'dnd', 'meeting']:
+            employee.status = status
+        
         employee.save()
         
         return Response({
@@ -383,6 +288,7 @@ def update_profile(request):
             "email": employee.email,
             "role": employee.role,
             "about": employee.about,
+            "status": employee.status,
             "avatarUrl": employee.get_avatar_url(),
             "message": "Profile updated successfully"
         }, status=200)
@@ -406,20 +312,25 @@ def upload_profile_image(request):
         
         allowed_types = ['image/jpeg', 'image/png', 'image/gif', 'image/webp']
         if image.content_type not in allowed_types:
-            return Response({"error": "Invalid file type. Use JPEG, PNG, GIF, or WebP"}, status=400)
+            return Response({"error": "Invalid file type"}, status=400)
         
         if image.size > 5 * 1024 * 1024:
             return Response({"error": "File too large. Maximum size is 5MB"}, status=400)
         
-        if employee.profile_image:
-            old_image_path = employee.profile_image.path
-            if os.path.exists(old_image_path):
-                os.remove(old_image_path)
+        old_image = employee.profile_image
         
-        ext = image.name.split('.')[-1]
-        image.name = f"profile_{employee.id}.{ext}"
+        ext = os.path.splitext(image.name)[1].lower() or '.jpg'
+        image.name = f"profile_{employee.id}{ext}"
         employee.profile_image = image
         employee.save()
+        
+        if old_image:
+            try:
+                old_path = old_image.path
+                if os.path.exists(old_path):
+                    os.remove(old_path)
+            except Exception:
+                pass
         
         return Response({
             "id": employee.id,
@@ -434,7 +345,7 @@ def upload_profile_image(request):
     except Employee.DoesNotExist:
         return Response({"error": "Employee not found"}, status=404)
     except Exception as e:
-        print(f"❌ Upload error: {e}")
+        logger.exception(f"Upload error: {e}")
         return Response({"error": str(e)}, status=500)
 
 
@@ -453,7 +364,7 @@ def get_messages(request, target_id):
                 (Q(sender=current_employee) & Q(receiver=target_employee)) |
                 (Q(sender=target_employee) & Q(receiver=current_employee))
             )
-        ).select_related('sender').prefetch_related('reactions').order_by("timestamp")
+        ).select_related('sender', 'receiver', 'reply_to').prefetch_related('reactions').order_by("timestamp")
 
         data = []
         for m in messages:
@@ -509,7 +420,6 @@ def upload_message_file(request):
         group_id = request.data.get('group_id')
         text_content = request.data.get('content', '').strip()
         
-        # Validate target
         receiver = None
         group = None
         
@@ -528,11 +438,9 @@ def upload_message_file(request):
         else:
             return Response({"error": "Either receiver_id or group_id is required"}, status=400)
         
-        # Validate file size (max 25MB)
         if file.size > 25 * 1024 * 1024:
             return Response({"error": "File too large. Maximum size is 25MB"}, status=400)
         
-        # Determine message type from file
         mime_type, _ = mimetypes.guess_type(file.name)
         if mime_type:
             if mime_type.startswith('image/'):
@@ -546,7 +454,6 @@ def upload_message_file(request):
         else:
             message_type = 'file'
         
-        # Create message
         msg = Message.objects.create(
             sender=current_employee,
             receiver=receiver,
@@ -577,9 +484,7 @@ def upload_message_file(request):
     except Employee.DoesNotExist:
         return Response({"error": "Employee not found"}, status=404)
     except Exception as e:
-        print(f"❌ File upload error: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.exception(f"File upload error: {e}")
         return Response({"error": str(e)}, status=500)
 
 
@@ -593,7 +498,6 @@ def add_reaction(request, message_id):
         current_employee = Employee.objects.get(user=request.user, is_active=True)
         message = Message.objects.get(id=message_id)
         
-        # Verify user can access this message
         if message.group:
             if current_employee not in message.group.members.all():
                 return Response({"error": "You are not a member of this group"}, status=403)
@@ -603,17 +507,16 @@ def add_reaction(request, message_id):
         
         reaction_type = request.data.get('reaction', '').strip()
         
-        if reaction_type not in ['ok', 'not_ok']:
-            return Response({"error": "Invalid reaction. Use 'ok' or 'not_ok'"}, status=400)
+        valid_reactions = ['ok', 'not_ok', 'love', 'laugh', 'wow', 'sad']
+        if reaction_type not in valid_reactions:
+            return Response({"error": f"Invalid reaction. Use one of: {', '.join(valid_reactions)}"}, status=400)
         
-        # Create or update reaction
         reaction, created = MessageReaction.objects.update_or_create(
             message=message,
             employee=current_employee,
             defaults={'reaction': reaction_type}
         )
         
-        # Get updated reaction counts
         reactions = list(message.reactions.values('reaction').annotate(count=Count('reaction')))
         
         return Response({
@@ -637,13 +540,11 @@ def remove_reaction(request, message_id):
         current_employee = Employee.objects.get(user=request.user, is_active=True)
         message = Message.objects.get(id=message_id)
         
-        # Delete reaction
         deleted, _ = MessageReaction.objects.filter(
             message=message,
             employee=current_employee
         ).delete()
         
-        # Get updated reaction counts
         reactions = list(message.reactions.values('reaction').annotate(count=Count('reaction')))
         
         return Response({
@@ -663,20 +564,17 @@ def remove_reaction(request, message_id):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def edit_message(request, message_id):
-    """Edit a message (sender only, within 15 minutes)"""
+    """Edit a message"""
     try:
         current_employee = Employee.objects.get(user=request.user, is_active=True)
         message = Message.objects.get(id=message_id)
         
-        # Check if user is the sender
         if message.sender != current_employee:
             return Response({"error": "You can only edit your own messages"}, status=403)
         
-        # Check if message can be edited (within 15 minutes)
         if not message.can_edit(current_employee):
             return Response({"error": "Message can only be edited within 15 minutes"}, status=400)
         
-        # Check if already deleted
         if message.is_deleted_for_everyone:
             return Response({"error": "Cannot edit deleted message"}, status=400)
         
@@ -684,6 +582,9 @@ def edit_message(request, message_id):
         
         if not new_content:
             return Response({"error": "Message content cannot be empty"}, status=400)
+        
+        if len(new_content) > 5000:
+            new_content = new_content[:5000]
         
         message.content = new_content
         message.is_edited = True
@@ -712,7 +613,6 @@ def delete_message_for_me(request, message_id):
         current_employee = Employee.objects.get(user=request.user, is_active=True)
         message = Message.objects.get(id=message_id)
         
-        # Verify user has access to this message
         if message.group:
             if current_employee not in message.group.members.all() and current_employee.role not in ['admin', 'superadmin']:
                 return Response({"error": "You don't have access to this message"}, status=403)
@@ -720,7 +620,6 @@ def delete_message_for_me(request, message_id):
             if message.sender != current_employee and message.receiver != current_employee:
                 return Response({"error": "You don't have access to this message"}, status=403)
         
-        # Create deletion record
         MessageDeletion.objects.get_or_create(
             message=message,
             employee=current_employee
@@ -741,26 +640,22 @@ def delete_message_for_me(request, message_id):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def delete_message_for_everyone(request, message_id):
-    """Delete message for everyone (sender only, within 1 hour)"""
+    """Delete message for everyone"""
     try:
         current_employee = Employee.objects.get(user=request.user, is_active=True)
         message = Message.objects.get(id=message_id)
         
-        # Check if user is the sender
         if message.sender != current_employee:
             return Response({"error": "You can only delete your own messages for everyone"}, status=403)
         
-        # Check if message can be deleted for everyone (within 1 hour)
         if not message.can_delete_for_everyone(current_employee):
             return Response({"error": "Message can only be deleted for everyone within 1 hour"}, status=400)
         
-        # Mark as deleted for everyone
         message.is_deleted_for_everyone = True
         message.deleted_at = timezone.now()
-        message.content = ""  # Clear content
+        message.content = ""
         message.save()
         
-        # Delete any files
         if message.file:
             message.file.delete()
         
@@ -781,7 +676,7 @@ def delete_message_for_everyone(request, message_id):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def create_group(request):
-    """Create a new group - Admin only"""
+    """Create a new group"""
     try:
         current_employee = Employee.objects.get(user=request.user, is_active=True)
         
@@ -791,6 +686,7 @@ def create_group(request):
         name = request.data.get('name', '').strip()
         description = request.data.get('description', '').strip()
         member_ids = request.data.get('members', [])
+        is_broadcast = request.data.get('is_broadcast', False)
         
         if not name:
             return Response({"error": "Group name is required"}, status=400)
@@ -798,18 +694,16 @@ def create_group(request):
         group = ChatGroup.objects.create(
             name=name,
             description=description,
-            created_by=current_employee
+            created_by=current_employee,
+            is_broadcast=is_broadcast
         )
         
-        # Add creator as member
         group.members.add(current_employee)
         
-        # Add other members
         if member_ids:
             members = Employee.objects.filter(id__in=member_ids, is_active=True)
             group.members.add(*members)
         
-        # Log activity
         log_admin_activity(
             admin=current_employee,
             action='create_group',
@@ -823,6 +717,7 @@ def create_group(request):
             "memberCount": group.members.count(),
             "createdBy": current_employee.name,
             "createdAt": group.created_at.isoformat(),
+            "isBroadcast": group.is_broadcast,
             "message": "Group created successfully"
         }, status=201)
         
@@ -844,10 +739,7 @@ def get_groups(request):
         
         data = []
         for g in groups:
-            # Get last message
             last_message = g.group_messages.order_by('-timestamp').first()
-            
-            # Get unread count
             unread_count = g.group_messages.filter(is_read=False).exclude(sender=current_employee).count()
             
             group_data = {
@@ -861,6 +753,7 @@ def get_groups(request):
                 "lastMessage": None,
                 "unreadCount": unread_count,
                 "isGroup": True,
+                "isBroadcast": g.is_broadcast,
             }
             
             if last_message:
@@ -873,7 +766,6 @@ def get_groups(request):
             
             data.append(group_data)
         
-        # Sort by last message
         data.sort(
             key=lambda x: x['lastMessage']['createdAt'] if x['lastMessage'] else '1970-01-01',
             reverse=True
@@ -893,7 +785,6 @@ def get_group_details(request, group_id):
         current_employee = Employee.objects.get(user=request.user, is_active=True)
         group = ChatGroup.objects.get(id=group_id)
         
-        # Check if user is member or admin
         is_member = current_employee in group.members.all()
         is_admin = current_employee.role in ['admin', 'superadmin']
         
@@ -906,6 +797,7 @@ def get_group_details(request, group_id):
             "email": m.email,
             "avatarUrl": m.get_avatar_url(),
             "role": m.role,
+            "status": m.status,
             "isCreator": m == group.created_by,
         } for m in group.members.all()]
         
@@ -921,6 +813,7 @@ def get_group_details(request, group_id):
             "createdAt": group.created_at.isoformat(),
             "isMember": is_member,
             "isAdmin": is_admin,
+            "isBroadcast": group.is_broadcast,
         }, status=200)
         
     except ChatGroup.DoesNotExist:
@@ -937,11 +830,10 @@ def get_group_messages(request, group_id):
         current_employee = Employee.objects.get(user=request.user, is_active=True)
         group = ChatGroup.objects.get(id=group_id)
         
-        # Check membership
         if current_employee not in group.members.all() and current_employee.role not in ['admin', 'superadmin']:
             return Response({"error": "You are not a member of this group"}, status=403)
         
-        messages = group.group_messages.select_related('sender').prefetch_related('reactions').order_by('timestamp')
+        messages = group.group_messages.select_related('sender', 'reply_to').prefetch_related('reactions').order_by('timestamp')
         
         data = []
         for m in messages:
@@ -949,7 +841,6 @@ def get_group_messages(request, group_id):
             if serialized:
                 data.append(serialized)
         
-        # Mark messages as read
         messages.exclude(sender=current_employee).filter(is_read=False).update(is_read=True)
         
         return Response(data, status=200)
@@ -963,12 +854,11 @@ def get_group_messages(request, group_id):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def add_group_members(request, group_id):
-    """Add members to group - Admin only"""
+    """Add members to group"""
     try:
         current_employee = Employee.objects.get(user=request.user, is_active=True)
         group = ChatGroup.objects.get(id=group_id)
         
-        # Only admin or group creator can add members
         if current_employee.role not in ['admin', 'superadmin'] and current_employee != group.created_by:
             return Response({"error": "Only admins or group creator can add members"}, status=403)
         
@@ -980,7 +870,6 @@ def add_group_members(request, group_id):
         members = Employee.objects.filter(id__in=member_ids, is_active=True)
         group.members.add(*members)
         
-        # Log activity
         log_admin_activity(
             admin=current_employee,
             action='add_member',
@@ -1001,7 +890,7 @@ def add_group_members(request, group_id):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def remove_group_member(request, group_id):
-    """Remove a member from group - Admin only"""
+    """Remove a member from group"""
     try:
         current_employee = Employee.objects.get(user=request.user, is_active=True)
         group = ChatGroup.objects.get(id=group_id)
@@ -1017,13 +906,11 @@ def remove_group_member(request, group_id):
         try:
             member = Employee.objects.get(id=member_id)
             
-            # Cannot remove creator
             if member == group.created_by:
                 return Response({"error": "Cannot remove group creator"}, status=400)
             
             group.members.remove(member)
             
-            # Log activity
             log_admin_activity(
                 admin=current_employee,
                 action='remove_member',
@@ -1048,7 +935,7 @@ def remove_group_member(request, group_id):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def update_group(request, group_id):
-    """Update group details - Admin only"""
+    """Update group details"""
     try:
         current_employee = Employee.objects.get(user=request.user, is_active=True)
         group = ChatGroup.objects.get(id=group_id)
@@ -1058,11 +945,14 @@ def update_group(request, group_id):
         
         name = request.data.get('name', '').strip()
         description = request.data.get('description', '').strip()
+        is_broadcast = request.data.get('is_broadcast')
         
         if name:
             group.name = name
         if description is not None:
             group.description = description
+        if is_broadcast is not None:
+            group.is_broadcast = is_broadcast
         
         group.save()
         
@@ -1070,6 +960,7 @@ def update_group(request, group_id):
             "id": group.id,
             "name": group.name,
             "description": group.description,
+            "isBroadcast": group.is_broadcast,
             "message": "Group updated successfully"
         }, status=200)
         
@@ -1108,7 +999,7 @@ def leave_group(request, group_id):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def create_meet(request):
-    """Create a Google Meet message with invitations"""
+    """Create a Google Meet message"""
     try:
         current_employee = Employee.objects.get(user=request.user, is_active=True)
         
@@ -1123,11 +1014,6 @@ def create_meet(request):
         if not meet_link:
             return Response({"error": "Meet link is required"}, status=400)
         
-        # Validate meet link
-        if not ('meet.google.com' in meet_link or 'zoom.us' in meet_link):
-            return Response({"error": "Please provide a valid Google Meet or Zoom link"}, status=400)
-        
-        # Parse scheduled time
         scheduled_datetime = None
         if scheduled_at:
             try:
@@ -1136,15 +1022,12 @@ def create_meet(request):
             except:
                 pass
         
-        # Determine target
         receiver = None
         group = None
         
         if group_id:
             try:
                 group = ChatGroup.objects.get(id=group_id)
-                if current_employee not in group.members.all() and current_employee.role not in ['admin', 'superadmin']:
-                    return Response({"error": "You are not a member of this group"}, status=403)
             except ChatGroup.DoesNotExist:
                 return Response({"error": "Group not found"}, status=404)
         elif receiver_id:
@@ -1155,7 +1038,6 @@ def create_meet(request):
         else:
             return Response({"error": "Either receiver_id or group_id is required"}, status=400)
         
-        # Create message
         content = f"📅 {meet_title}"
         if scheduled_datetime:
             content += f"\n🕐 Scheduled: {scheduled_datetime.strftime('%B %d, %Y at %I:%M %p')}"
@@ -1172,7 +1054,6 @@ def create_meet(request):
             meet_scheduled_at=scheduled_datetime,
         )
         
-        # Create invitations for specified employees
         invitations = []
         if invitee_ids:
             invitees = Employee.objects.filter(id__in=invitee_ids, is_active=True)
@@ -1189,7 +1070,6 @@ def create_meet(request):
                         "status": invitation.status
                     })
         elif group:
-            # Invite all group members
             for member in group.members.exclude(id=current_employee.id):
                 invitation, created = MeetingInvitation.objects.get_or_create(
                     message=message,
@@ -1202,8 +1082,8 @@ def create_meet(request):
                     "status": invitation.status
                 })
         
-        # Save link for future use if requested
         if save_link:
+            from django.db.models import F
             saved, created = SavedMeetLink.objects.get_or_create(
                 employee=current_employee,
                 meet_link=meet_link,
@@ -1227,9 +1107,7 @@ def create_meet(request):
     except Employee.DoesNotExist:
         return Response({"error": "Employee not found"}, status=404)
     except Exception as e:
-        print(f"❌ Create meet error: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.exception(f"Create meet error: {e}")
         return Response({"error": str(e)}, status=500)
 
 
@@ -1285,7 +1163,7 @@ def respond_to_meet_invite(request, message_id):
         status = request.data.get('status', '').strip()
         
         if status not in ['accepted', 'declined', 'attended']:
-            return Response({"error": "Invalid status. Use: accepted, declined, or attended"}, status=400)
+            return Response({"error": "Invalid status"}, status=400)
         
         try:
             invitation = MeetingInvitation.objects.get(
@@ -1315,14 +1193,10 @@ def respond_to_meet_invite(request, message_id):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def admin_get_all_employees(request):
-    """
-    Admin only: Get all employees with their chat statistics
-    Shows total messages sent/received, active chats, etc.
-    """
+    """Admin only: Get all employees with statistics"""
     try:
         current_employee = Employee.objects.get(user=request.user, is_active=True)
         
-        # Check if user is admin
         if current_employee.role not in ['admin', 'superadmin']:
             return Response({"error": "Admin access required"}, status=403)
         
@@ -1330,11 +1204,9 @@ def admin_get_all_employees(request):
         
         data = []
         for emp in employees:
-            # Get message statistics
             sent_count = Message.objects.filter(sender=emp).count()
             received_count = Message.objects.filter(receiver=emp).count()
             
-            # Get unique chat partners count
             chat_partners = Message.objects.filter(
                 Q(sender=emp) | Q(receiver=emp),
                 group__isnull=True
@@ -1346,10 +1218,8 @@ def admin_get_all_employees(request):
                 if receiver_id and receiver_id != emp.id:
                     unique_partners.add(receiver_id)
             
-            # Get groups count
             groups_count = emp.group_memberships.count()
             
-            # Get last activity
             last_message = Message.objects.filter(
                 Q(sender=emp) | Q(receiver=emp)
             ).order_by('-timestamp').first()
@@ -1360,6 +1230,7 @@ def admin_get_all_employees(request):
                 "email": emp.email,
                 "role": emp.role,
                 "about": emp.about,
+                "status": emp.status,
                 "avatarUrl": emp.get_avatar_url(),
                 "createdAt": emp.created_at.isoformat(),
                 "stats": {
@@ -1373,7 +1244,6 @@ def admin_get_all_employees(request):
             }
             data.append(emp_data)
         
-        # Sort by last activity
         data.sort(key=lambda x: x['lastActivity'] or '1970-01-01', reverse=True)
         
         return Response({
@@ -1389,22 +1259,73 @@ def admin_get_all_employees(request):
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
-def admin_view_employee_dashboard(request, employee_id):
-    """
-    Admin only: View an employee's chat dashboard (their contact list with messages)
-    This is like "logging in as" the employee to see their chats
-    """
+def admin_get_statistics(request):
+    """Admin only: Get overall chat statistics"""
     try:
         current_employee = Employee.objects.get(user=request.user, is_active=True)
         
-        # Check if user is admin
         if current_employee.role not in ['admin', 'superadmin']:
             return Response({"error": "Admin access required"}, status=403)
         
-        # Get target employee
+        total_employees = Employee.objects.filter(is_active=True).count()
+        total_groups = ChatGroup.objects.count()
+        total_messages = Message.objects.count()
+        
+        today = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        messages_today = Message.objects.filter(timestamp__gte=today).count()
+        
+        week_ago = today - timedelta(days=7)
+        messages_this_week = Message.objects.filter(timestamp__gte=week_ago).count()
+        
+        top_users = Employee.objects.filter(is_active=True).annotate(
+            msg_count=Count('sent_messages')
+        ).order_by('-msg_count')[:5]
+        
+        top_users_data = [{
+            "id": u.id,
+            "name": u.name,
+            "avatarUrl": u.get_avatar_url(),
+            "messageCount": u.msg_count,
+        } for u in top_users]
+        
+        top_groups = ChatGroup.objects.annotate(
+            msg_count=Count('group_messages')
+        ).order_by('-msg_count')[:5]
+        
+        top_groups_data = [{
+            "id": g.id,
+            "name": g.name,
+            "avatarUrl": g.get_group_image_url(),
+            "messageCount": g.msg_count,
+            "memberCount": g.members.count(),
+        } for g in top_groups]
+        
+        return Response({
+            "totalEmployees": total_employees,
+            "totalGroups": total_groups,
+            "totalMessages": total_messages,
+            "messagesToday": messages_today,
+            "messagesThisWeek": messages_this_week,
+            "topUsers": top_users_data,
+            "topGroups": top_groups_data,
+        }, status=200)
+        
+    except Employee.DoesNotExist:
+        return Response({"error": "Employee not found"}, status=404)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def admin_view_employee_dashboard(request, employee_id):
+    """Admin only: View an employee's chat dashboard"""
+    try:
+        current_employee = Employee.objects.get(user=request.user, is_active=True)
+        
+        if current_employee.role not in ['admin', 'superadmin']:
+            return Response({"error": "Admin access required"}, status=403)
+        
         target_employee = Employee.objects.get(id=employee_id, is_active=True)
         
-        # Log admin activity
         log_admin_activity(
             admin=current_employee,
             action='view_employee',
@@ -1412,12 +1333,10 @@ def admin_view_employee_dashboard(request, employee_id):
             details={'viewed_dashboard': True}
         )
         
-        # Get all employees this employee has chatted with
         employees = Employee.objects.filter(is_active=True).exclude(id=target_employee.id)
         
         contacts = []
         for emp in employees:
-            # Get conversation between target employee and this employee
             last_message = Message.objects.filter(
                 Q(group__isnull=True) & (
                     (Q(sender=target_employee) & Q(receiver=emp)) |
@@ -1425,7 +1344,6 @@ def admin_view_employee_dashboard(request, employee_id):
                 )
             ).order_by('-timestamp').first()
             
-            # Count total messages
             total_messages = Message.objects.filter(
                 Q(group__isnull=True) & (
                     (Q(sender=target_employee) & Q(receiver=emp)) |
@@ -1433,7 +1351,6 @@ def admin_view_employee_dashboard(request, employee_id):
                 )
             ).count()
             
-            # Only include if there's chat history
             if last_message:
                 contact_data = {
                     "id": emp.id,
@@ -1452,7 +1369,6 @@ def admin_view_employee_dashboard(request, employee_id):
                 }
                 contacts.append(contact_data)
         
-        # Sort by last message time
         contacts.sort(key=lambda x: x['lastMessage']['createdAt'], reverse=True)
         
         return Response({
@@ -1479,22 +1395,16 @@ def admin_view_employee_dashboard(request, employee_id):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def admin_view_employee_messages(request, employee_id, target_id):
-    """
-    Admin only: View messages between two employees
-    Returns messages from the perspective of employee_id
-    """
+    """Admin only: View messages between two employees"""
     try:
         current_employee = Employee.objects.get(user=request.user, is_active=True)
         
-        # Check if user is admin
         if current_employee.role not in ['admin', 'superadmin']:
             return Response({"error": "Admin access required"}, status=403)
         
-        # Get both employees
         employee = Employee.objects.get(id=employee_id, is_active=True)
         target = Employee.objects.get(id=target_id, is_active=True)
         
-        # Log admin activity
         log_admin_activity(
             admin=current_employee,
             action='view_chat',
@@ -1502,15 +1412,13 @@ def admin_view_employee_messages(request, employee_id, target_id):
             details={'viewing_chat_with': target.id, 'target_name': target.name}
         )
         
-        # Get all messages between them
         messages = Message.objects.filter(
             Q(group__isnull=True) & (
                 (Q(sender=employee) & Q(receiver=target)) |
                 (Q(sender=target) & Q(receiver=employee))
             )
-        ).select_related('sender', 'receiver').prefetch_related('reactions').order_by('timestamp')
+        ).select_related('sender', 'receiver', 'reply_to').prefetch_related('reactions').order_by('timestamp')
         
-        # Serialize from employee's perspective
         data = []
         for msg in messages:
             serialized = serialize_message(msg, current_employee, viewing_as_admin=True, target_employee=employee)
@@ -1544,28 +1452,21 @@ def admin_view_employee_messages(request, employee_id, target_id):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def admin_view_employee_groups(request, employee_id):
-    """
-    Admin only: View all groups an employee is part of
-    """
+    """Admin only: View all groups an employee is part of"""
     try:
         current_employee = Employee.objects.get(user=request.user, is_active=True)
         
-        # Check if user is admin
         if current_employee.role not in ['admin', 'superadmin']:
             return Response({"error": "Admin access required"}, status=403)
         
-        # Get target employee
         employee = Employee.objects.get(id=employee_id, is_active=True)
         
-        # Get all groups they're a member of
         groups = employee.group_memberships.all()
         
         data = []
         for group in groups:
             last_message = group.group_messages.order_by('-timestamp').first()
             message_count = group.group_messages.count()
-            
-            # Count messages sent by this employee in this group
             employee_messages = group.group_messages.filter(sender=employee).count()
             
             group_data = {
@@ -1590,7 +1491,6 @@ def admin_view_employee_groups(request, employee_id):
             
             data.append(group_data)
         
-        # Sort by last message
         data.sort(
             key=lambda x: x['lastMessage']['createdAt'] if x['lastMessage'] else '1970-01-01',
             reverse=True
@@ -1616,25 +1516,19 @@ def admin_view_employee_groups(request, employee_id):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def admin_view_employee_group_messages(request, employee_id, group_id):
-    """
-    Admin only: View group messages from employee's perspective
-    """
+    """Admin only: View group messages from employee's perspective"""
     try:
         current_employee = Employee.objects.get(user=request.user, is_active=True)
         
-        # Check if user is admin
         if current_employee.role not in ['admin', 'superadmin']:
             return Response({"error": "Admin access required"}, status=403)
         
-        # Get employee and group
         employee = Employee.objects.get(id=employee_id, is_active=True)
         group = ChatGroup.objects.get(id=group_id)
         
-        # Check if employee is member of group
         if employee not in group.members.all():
             return Response({"error": "Employee is not a member of this group"}, status=400)
         
-        # Log activity
         log_admin_activity(
             admin=current_employee,
             action='view_chat',
@@ -1642,10 +1536,8 @@ def admin_view_employee_group_messages(request, employee_id, group_id):
             details={'viewing_group': group.id, 'group_name': group.name}
         )
         
-        # Get all group messages
-        messages = group.group_messages.select_related('sender').prefetch_related('reactions').order_by('timestamp')
+        messages = group.group_messages.select_related('sender', 'reply_to').prefetch_related('reactions').order_by('timestamp')
         
-        # Serialize from employee's perspective
         data = []
         for msg in messages:
             serialized = serialize_message(msg, current_employee, viewing_as_admin=True, target_employee=employee)
@@ -1653,7 +1545,6 @@ def admin_view_employee_group_messages(request, employee_id, group_id):
                 serialized["isFromViewedEmployee"] = msg.sender.id == employee.id
                 data.append(serialized)
         
-        # Get group members
         members = [{
             "id": m.id,
             "name": m.name,
@@ -1694,21 +1585,16 @@ def admin_view_employee_group_messages(request, employee_id, group_id):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def admin_get_activity_log(request):
-    """
-    Admin only: Get admin activity log
-    """
+    """Admin only: Get admin activity log"""
     try:
         current_employee = Employee.objects.get(user=request.user, is_active=True)
         
-        # Check if user is admin
         if current_employee.role not in ['admin', 'superadmin']:
             return Response({"error": "Admin access required"}, status=403)
         
-        # Get query params
         limit = int(request.GET.get('limit', 100))
         offset = int(request.GET.get('offset', 0))
         
-        # Get activity logs
         logs = AdminActivityLog.objects.select_related(
             'admin', 'target_employee'
         ).order_by('-timestamp')[offset:offset+limit]
@@ -1743,9 +1629,7 @@ def admin_get_activity_log(request):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def admin_exit_employee_view(request):
-    """
-    Admin only: Exit employee view mode and return to admin dashboard
-    """
+    """Admin only: Exit employee view mode"""
     try:
         current_employee = Employee.objects.get(user=request.user, is_active=True)
         
@@ -1774,70 +1658,169 @@ def admin_exit_employee_view(request):
         
     except Employee.DoesNotExist:
         return Response({"error": "Employee not found"}, status=404)
-
-
-# ==================== ADMIN STATISTICS ====================
-
-@api_view(["GET"])
+    
+# Add to views.py
+@api_view(["POST"])
 @permission_classes([IsAuthenticated])
-def admin_get_statistics(request):
-    """
-    Admin only: Get overall chat statistics
-    """
+def forward_messages(request):
+    """Forward messages to multiple contacts/groups, preserving files and meets"""
     try:
         current_employee = Employee.objects.get(user=request.user, is_active=True)
+        if getattr(current_employee, 'is_suspended', False): return Response({"error": "Suspended"}, status=403)
         
-        if current_employee.role not in ['admin', 'superadmin']:
-            return Response({"error": "Admin access required"}, status=403)
+        messages_data = request.data.get('messages', [])
+        target_ids = request.data.get('target_ids', [])
+
+        if not messages_data or not target_ids: return Response({"error": "Required fields missing"}, status=400)
+        channel_layer = get_channel_layer()
+
+        for target in target_ids:
+            receiver, group = None, None
+            room_group_name = None
+            target_str = str(target)
+            
+            if target_str.startswith('group-'):
+                group_id = int(target_str.replace('group-', ''))
+                try: 
+                    group = ChatGroup.objects.get(id=group_id)
+                    room_group_name = f"group_{group_id}"
+                except ChatGroup.DoesNotExist: continue
+            else:
+                receiver_id = int(target_str.replace('emp-', ''))
+                try: 
+                    receiver = Employee.objects.get(id=receiver_id, is_active=True)
+                    ids = sorted([current_employee.id, receiver_id])
+                    room_group_name = f"chat_{ids[0]}_{ids[1]}"
+                except Employee.DoesNotExist: continue
+
+            for msg_data in messages_data:
+                try:
+                    original = Message.objects.get(id=msg_data.get('id'))
+                    msg = Message.objects.create(
+                        sender=current_employee, receiver=receiver, group=group,
+                        content=original.content, message_type=original.message_type,
+                        file=original.file, file_name=original.file_name, file_size=original.file_size,
+                        meet_link=original.meet_link, meet_title=original.meet_title, meet_scheduled_at=original.meet_scheduled_at,
+                        is_read=False
+                    )
+                    
+                    # ✅ SEND LIVE WEBSOCKET EVENT TO THE RECEIVER!
+                    if room_group_name:
+                        async_to_sync(channel_layer.group_send)(
+                            room_group_name,
+                            {
+                                "type": "chat_message",
+                                "data": {
+                                    "id": msg.id, "text": msg.content, "sender_id": current_employee.id,
+                                    "sender_name": current_employee.name, "sender_avatar": current_employee.get_avatar_url(),
+                                    "receiver_id": receiver.id if receiver else None, "group_id": group.id if group else None,
+                                    "createdAt": msg.timestamp.isoformat(), "messageType": msg.message_type,
+                                    "fileUrl": msg.get_file_url(), "fileName": msg.file_name, "fileSize": msg.file_size,
+                                    "meetLink": msg.meet_link, "meetTitle": msg.meet_title, "meetScheduledAt": msg.meet_scheduled_at.isoformat() if msg.meet_scheduled_at else None,
+                                    "isForwarded": True
+                                }
+                            }
+                        )
+                except Message.DoesNotExist: pass
+
+        return Response({"message": "Messages forwarded successfully"}, status=200)
+    except Exception as e: return Response({"error": str(e)}, status=500)
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def toggle_message_star(request, message_id):
+    try:
+        current_employee = Employee.objects.get(user=request.user, is_active=True)
+        message = Message.objects.get(id=message_id)
+
+        # This logic matches what the frontend expects
+        if current_employee in message.starred_by.all():
+            message.starred_by.remove(current_employee)
+            status = "unstarred"
+        else:
+            message.starred_by.add(current_employee)
+            status = "starred"
+
+        return Response({"message": f"Message {status}", "status": status}, status=200)
+    except Message.DoesNotExist:
+        return Response({"error": "Message not found"}, status=404)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def toggle_message_pin(request, message_id):
+    """Toggle the pinned status of a message"""
+    try:
+        current_employee = Employee.objects.get(user=request.user, is_active=True)
+        message = Message.objects.get(id=message_id)
+
+        # Logic: If it's pinned, unpin it. If not, pin it.
+        message.is_pinned = not message.is_pinned
+        message.save()
+
+        status = "pinned" if message.is_pinned else "unpinned"
         
-        # Get counts
-        total_employees = Employee.objects.filter(is_active=True).count()
-        total_groups = ChatGroup.objects.count()
-        total_messages = Message.objects.count()
-        
-        # Messages today
-        from datetime import datetime, timedelta
-        today = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        messages_today = Message.objects.filter(timestamp__gte=today).count()
-        
-        # Messages this week
-        week_ago = today - timedelta(days=7)
-        messages_this_week = Message.objects.filter(timestamp__gte=week_ago).count()
-        
-        # Most active users (by messages sent)
-        top_users = Employee.objects.filter(is_active=True).annotate(
-            msg_count=Count('sent_messages')
-        ).order_by('-msg_count')[:5]
-        
-        top_users_data = [{
-            "id": u.id,
-            "name": u.name,
-            "avatarUrl": u.get_avatar_url(),
-            "messageCount": u.msg_count,
-        } for u in top_users]
-        
-        # Most active groups
-        top_groups = ChatGroup.objects.annotate(
-            msg_count=Count('group_messages')
-        ).order_by('-msg_count')[:5]
-        
-        top_groups_data = [{
-            "id": g.id,
-            "name": g.name,
-            "avatarUrl": g.get_group_image_url(),
-            "messageCount": g.msg_count,
-            "memberCount": g.members.count(),
-        } for g in top_groups]
-        
+        # Log activity if it's a group message and user is admin
+        if message.group and current_employee.role in ['admin', 'superadmin']:
+            log_admin_activity(
+                admin=current_employee,
+                action='pin_message',
+                details={'message_id': message.id, 'group_id': message.group.id, 'status': status}
+            )
+
         return Response({
-            "totalEmployees": total_employees,
-            "totalGroups": total_groups,
-            "totalMessages": total_messages,
-            "messagesToday": messages_today,
-            "messagesThisWeek": messages_this_week,
-            "topUsers": top_users_data,
-            "topGroups": top_groups_data,
+            "message": f"Message {status} successfully",
+            "status": status,
+            "isPinned": message.is_pinned
         }, status=200)
+    except Message.DoesNotExist:
+        return Response({"error": "Message not found"}, status=404)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def toggle_block_user(request, target_id):
+    try:
+        current_employee = Employee.objects.get(user=request.user, is_active=True)
+        clean_target_id = str(target_id).replace('emp-', '')
+        target_employee = Employee.objects.get(id=clean_target_id, is_active=True)
+
+        if current_employee == target_employee: return Response({"error": "You cannot block yourself"}, status=400)
+
+        # ✅ ADMIN GLOBAL SUSPENSION
+        if current_employee.role in ['admin', 'superadmin']:
+            target_employee.is_suspended = not target_employee.is_suspended
+            target_employee.save()
+            status = "suspended" if target_employee.is_suspended else "unsuspended"
+            return Response({"message": f"Employee globally {status} successfully", "status": status, "isBlocked": target_employee.is_suspended, "isAdminBlock": True}, status=200)
+            
+        # PERSONAL BLOCK
+        else:
+            if target_employee in current_employee.blocked_users.all():
+                current_employee.blocked_users.remove(target_employee)
+                status = "unblocked"
+            else:
+                current_employee.blocked_users.add(target_employee)
+                status = "blocked"
+            return Response({"message": f"User {status} successfully", "status": status, "isBlocked": status == "blocked", "isAdminBlock": False}, status=200)
+
+    except Employee.DoesNotExist:
+        return Response({"error": "Employee not found"}, status=404)
+    
+@api_view(["DELETE"])
+@permission_classes([IsAuthenticated])
+def admin_delete_employee(request, employee_id):
+    try:
+        current_employee = Employee.objects.get(user=request.user, is_active=True)
+        if current_employee.role not in ['admin', 'superadmin']: return Response({"error": "Only admins can delete employees"}, status=403)
+            
+        target_id = str(employee_id).replace('emp-', '')
+        target_employee = Employee.objects.get(id=target_id)
         
+        target_employee.is_active = False
+        target_employee.user.is_active = False
+        target_employee.user.save()
+        target_employee.save()
+        
+        return Response({"message": "Employee deleted successfully"}, status=200)
     except Employee.DoesNotExist:
         return Response({"error": "Employee not found"}, status=404)
