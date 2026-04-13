@@ -26,10 +26,11 @@ class EmployeeAdmin(admin.ModelAdmin):
             'fields': ('name', 'email', 'role', 'status')
         }),
         ('Password', {
-            'fields': ('plain_password',),
+            # ✅ Changed from plain_password to password
+            'fields': ('password',),
             'description': (
-                'Enter a password here. It will be synced to Django auth '
-                'when you save. This field stores the readable password for admin reference.'
+                'Enter a password here. This is stored as plain text '
+                'for admin reference and used directly for login authentication.'
             ),
         }),
         ('Profile', {
@@ -71,8 +72,9 @@ class EmployeeAdmin(admin.ModelAdmin):
     profile_preview.short_description = 'Image Preview'
 
     def password_display(self, obj):
-        if obj.plain_password:
-            pw = obj.plain_password
+        # ✅ Changed from obj.plain_password to obj.password
+        if obj.password:
+            pw = obj.password
             if len(pw) > 3:
                 masked = pw[:2] + '•' * (len(pw) - 3) + pw[-1]
             else:
@@ -91,18 +93,20 @@ class EmployeeAdmin(admin.ModelAdmin):
     def save_model(self, request, obj, form, change):
         """
         When saving an Employee from admin:
-        1. If plain_password changed, sync it to Django User auth
-        2. If no User exists yet, create one automatically
+        - Password is stored directly in Employee.password field
+        - Django User is created/updated for session management only
+        - Django User gets unusable password (not used for auth)
         """
-        new_password = obj.plain_password
+        # ✅ Use obj.password instead of obj.plain_password
+        new_password = obj.password
 
         if not change:
-            # Creating new employee
+            # ── Creating new employee ────────────────────────
             if not new_password:
                 new_password = 'changeme123'
-                obj.plain_password = new_password
+                obj.password = new_password  # ✅ Fixed field name
 
-            # Create Django User if not exists
+            # Create Django User for session management only
             if not obj.user:
                 user, created = User.objects.get_or_create(
                     username=obj.email,
@@ -112,46 +116,48 @@ class EmployeeAdmin(admin.ModelAdmin):
                         'is_active': True,
                     }
                 )
-                user.set_password(new_password)
+                # ✅ Set unusable password - Django User not used for auth
+                user.set_unusable_password()
+                user.first_name = obj.name
+                user.email = obj.email
+                user.is_active = True
                 user.save()
                 obj.user = user
 
             obj.save()
+
         else:
-            # Editing existing employee
-            # Check if password was changed
+            # ── Editing existing employee ────────────────────
             if obj.pk:
                 try:
                     old_obj = Employee.objects.get(pk=obj.pk)
-                    old_password = old_obj.plain_password
+                    old_password = old_obj.password  # ✅ Fixed field name
                 except Employee.DoesNotExist:
                     old_password = ""
 
-                if new_password and new_password != old_password:
-                    # Password changed — sync to Django User
-                    if obj.user:
-                        obj.user.set_password(new_password)
-                        obj.user.first_name = obj.name
-                        obj.user.email = obj.email
-                        obj.user.save()
-                    else:
-                        # Create user if somehow missing
-                        user, created = User.objects.get_or_create(
-                            username=obj.email,
-                            defaults={
-                                'email': obj.email,
-                                'first_name': obj.name,
-                                'is_active': True,
-                            }
-                        )
-                        user.set_password(new_password)
-                        user.save()
-                        obj.user = user
+                # Sync Django User info (name/email) but NOT password
+                if obj.user:
+                    obj.user.first_name = obj.name
+                    obj.user.email = obj.email
+                    obj.user.is_active = obj.is_active
+                    obj.user.save()
+                else:
+                    # Create Django User if missing
+                    user, created = User.objects.get_or_create(
+                        username=obj.email,
+                        defaults={
+                            'email': obj.email,
+                            'first_name': obj.name,
+                            'is_active': obj.is_active,
+                        }
+                    )
+                    user.set_unusable_password()
+                    user.save()
+                    obj.user = user
 
             super().save_model(request, obj, form, change)
 
     def get_readonly_fields(self, request, obj=None):
-        """Make user field always readonly"""
         readonly = list(self.readonly_fields)
         return readonly
 
@@ -267,7 +273,7 @@ class PollAdmin(admin.ModelAdmin):
 
     def message_link(self, obj):
         return format_html(
-            '<a href="/admin/chat/message/{}/change/">Message #{}</a>',
+            '<a href="/admin/app/message/{}/change/">Message #{}</a>',
             obj.message.id, obj.message.id
         )
     message_link.short_description = 'Message'
@@ -307,8 +313,8 @@ class PollAdmin(admin.ModelAdmin):
                 .values_list('employee__name', flat=True)
             )
             voter_str = ", ".join(voters) if voters else "—"
-
             bar_color = '#00a884' if vote_count > 0 else '#e9edef'
+
             rows.append(format_html(
                 '<div style="margin-bottom:12px;">'
                 '  <div style="display:flex;justify-content:space-between;margin-bottom:4px;">'
