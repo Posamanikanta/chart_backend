@@ -2,7 +2,10 @@ import json
 import logging
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
-from .models import Message, Employee, ChatGroup, MessageReaction, MessageDeletion
+from .models import (
+    Message, Employee, ChatGroup, MessageReaction, 
+    MessageDeletion, Poll, PollOption, PollVote
+)
 from django.db.models import Count
 from django.utils import timezone
 
@@ -23,7 +26,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 await self.close()
                 return
             
-            # ✅ SECURITY: Drop connection immediately if user is suspended
             if employee.get('is_suspended', False):
                 logger.warning(f"Suspended user {employee['email']} attempted to connect.")
                 await self.close()
@@ -74,6 +76,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
             elif msg_type == "edit": await self.handle_edit(data)
             elif msg_type == "delete": await self.handle_delete(data)
             elif msg_type == "read": await self.handle_read(data)
+            elif msg_type == "poll_vote": await self.handle_poll_vote(data)
                 
         except Exception as e:
             logger.exception(f"Receive Error: {e}")
@@ -81,7 +84,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
     async def handle_message(self, data):
         message_text = data.get("message", "").strip()
         if not message_text: return
-        
         msg_obj = await self.save_message(message_text, reply_to_id=data.get("reply_to"))
         if msg_obj:
             await self.channel_layer.group_send(self.room_group_name, {"type": "chat_message", "data": msg_obj})
@@ -93,7 +95,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
     async def handle_typing(self, data):
         await self.channel_layer.group_send(self.room_group_name, {
-            "type": "typing_indicator", "data": { "sender_id": self.employee_id, "is_typing": data.get("is_typing", False) }
+            "type": "typing_indicator", "data": {"sender_id": self.employee_id, "is_typing": data.get("is_typing", False)}
         })
 
     async def handle_edit(self, data):
@@ -109,6 +111,12 @@ class ChatConsumer(AsyncWebsocketConsumer):
     async def handle_read(self, data):
         await self.mark_messages_read()
         await self.channel_layer.group_send(self.room_group_name, {"type": "messages_read", "data": {"reader_id": self.employee_id, "target_id": self.target_id}})
+
+    async def handle_poll_vote(self, data):
+        """Handle poll vote via WebSocket"""
+        result = await self.save_poll_vote(data.get("poll_id"), data.get("option_id"))
+        if result:
+            await self.channel_layer.group_send(self.room_group_name, {"type": "poll_update", "data": result})
 
     # --- WEBSOCKET EVENT SENDERS ---
     async def chat_message(self, event): 
@@ -130,12 +138,20 @@ class ChatConsumer(AsyncWebsocketConsumer):
     async def messages_read(self, event): 
         await self.send(text_data=json.dumps({"type": "read", "data": event["data"]}))
 
+    async def poll_update(self, event):
+        """Send poll update to client with personalized myVotes"""
+        data = event["data"].copy()
+        # Fetch personalized myVotes for this specific employee
+        my_votes = await self.get_my_poll_votes(data.get("poll_id"))
+        data["myVotes"] = my_votes
+        await self.send(text_data=json.dumps({"type": "poll_update", "data": data}))
+
     # --- DATABASE METHODS ---
     @database_sync_to_async
     def get_employee(self, user):
         try:
             employee = Employee.objects.get(user=user, is_active=True)
-            return { 'id': employee.id, 'name': employee.name, 'email': employee.email, 'is_suspended': employee.is_suspended }
+            return {'id': employee.id, 'name': employee.name, 'email': employee.email, 'is_suspended': employee.is_suspended}
         except Employee.DoesNotExist:
             return None
 
@@ -147,24 +163,18 @@ class ChatConsumer(AsyncWebsocketConsumer):
     def save_message(self, text, message_type='text', file_url=None, file_name=None, file_size=None, reply_to_id=None):
         try:
             sender = Employee.objects.get(id=self.employee_id, is_active=True)
-            if sender.is_suspended: return None 
+            if sender.is_suspended: return None
 
             receiver = Employee.objects.get(id=self.target_id, is_active=True)
             
             reply_to = None
             reply_to_data = None
             if reply_to_id:
-                # ✅ FIX: React sometimes sends a full object instead of an ID. Extract the ID safely to prevent crashing.
                 if isinstance(reply_to_id, dict):
                     reply_to_id = reply_to_id.get('id')
-                
                 try: 
                     reply_to = Message.objects.get(id=reply_to_id)
-                    reply_to_data = {
-                        "id": reply_to.id,
-                        "text": reply_to.content[:100] if reply_to.content else "",
-                        "sender_name": reply_to.sender.name
-                    }
+                    reply_to_data = {"id": reply_to.id, "text": reply_to.content[:100] if reply_to.content else "", "sender_name": reply_to.sender.name}
                 except Message.DoesNotExist: pass
             
             msg = Message.objects.create(
@@ -173,50 +183,37 @@ class ChatConsumer(AsyncWebsocketConsumer):
             )
             
             return {
-                "id": msg.id, 
-                "text": msg.content, 
-                "sender_id": sender.id, 
-                "sender_name": sender.name,
-                "sender_avatar": sender.get_avatar_url(), 
-                "receiver_id": receiver.id, 
+                "id": msg.id, "text": msg.content,
+                "type": msg.message_type, "messageType": msg.message_type,
+                "sender_id": sender.id, "sender_name": sender.name, "senderName": sender.name,
+                "sender_avatar": sender.get_avatar_url(), "receiver_id": receiver.id,
                 "createdAt": msg.timestamp.isoformat(),
-                "messageType": msg.message_type, 
-                "fileUrl": file_url, 
-                "fileName": file_name, 
-                "fileSize": file_size,
-                "reactions": {}, 
-                "userReaction": None, 
-                "isEdited": False, 
-                "canEdit": True, 
-                "canDeleteForEveryone": True,
-                "replyTo": reply_to_data, 
-                "isRead": False,
-                "isPinned": False,      
-                "isStarred": False,     
-                "thread": [],           
+                "fileUrl": file_url, "fileName": file_name, "fileSize": file_size,
+                "reactions": {}, "userReaction": None, "isEdited": False,
+                "canEdit": True, "canDeleteForEveryone": True,
+                "replyTo": reply_to_data, "isRead": False, "isPinned": False, "isStarred": False, "thread": [],
+                "isMine": None,
             }
         except Exception as e:
             logger.exception(f"Save Error: {e}")
             return None
-
+        
     @database_sync_to_async
     def save_reaction(self, message_id, reaction):
         try:
             employee = Employee.objects.get(id=self.employee_id, is_active=True)
-            if employee.is_suspended: return None # ✅ SECURITY
+            if employee.is_suspended: return None
             
             message = Message.objects.get(id=message_id)
             valid_reactions = ['ok', 'not_ok', 'love', 'laugh', 'wow', 'sad']
             
             if reaction in valid_reactions:
-                MessageReaction.objects.update_or_create(
-                    message=message, employee=employee, defaults={'reaction': reaction}
-                )
+                MessageReaction.objects.update_or_create(message=message, employee=employee, defaults={'reaction': reaction})
             elif reaction is None:
                 MessageReaction.objects.filter(message=message, employee=employee).delete()
             
             reactions = list(message.reactions.values('reaction').annotate(count=Count('reaction')))
-            return { "message_id": message_id, "reactions": {r['reaction']: r['count'] for r in reactions}, "employee_id": self.employee_id, "reaction": reaction }
+            return {"message_id": message_id, "reactions": {r['reaction']: r['count'] for r in reactions}, "employee_id": self.employee_id, "reaction": reaction}
         except Exception: return None
 
     @database_sync_to_async
@@ -230,7 +227,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
             message.is_edited = True
             message.edited_at = timezone.now()
             message.save()
-            return { "message_id": message_id, "content": new_content, "isEdited": True, "editedAt": message.edited_at.isoformat() }
+            return {"message_id": message_id, "content": new_content, "isEdited": True, "editedAt": message.edited_at.isoformat()}
         except Exception: return None
 
     @database_sync_to_async
@@ -247,10 +244,10 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 message.content = ""
                 message.save()
                 if message.file: message.file.delete()
-                return { "message_id": message_id, "deletedForEveryone": True }
+                return {"message_id": message_id, "deletedForEveryone": True}
             else:
                 MessageDeletion.objects.get_or_create(message=message, employee=employee)
-                return { "message_id": message_id, "deletedForMe": True }
+                return {"message_id": message_id, "deletedForMe": True}
         except Exception: return None
 
     @database_sync_to_async
@@ -258,6 +255,76 @@ class ChatConsumer(AsyncWebsocketConsumer):
         try:
             Message.objects.filter(sender_id=self.target_id, receiver_id=self.employee_id, is_read=False, group__isnull=True).update(is_read=True)
         except Exception: pass
+
+    @database_sync_to_async
+    def save_poll_vote(self, poll_id, option_id):
+        """Save a poll vote and return updated poll data"""
+        try:
+            employee = Employee.objects.get(id=self.employee_id, is_active=True)
+            if employee.is_suspended: return None
+            
+            poll = Poll.objects.get(id=poll_id)
+            option = PollOption.objects.get(id=option_id, poll=poll)
+            
+            # Check access
+            message = poll.message
+            if message.group:
+                if employee not in message.group.members.all() and employee.role not in ['admin', 'superadmin']:
+                    return None
+            else:
+                if message.sender != employee and message.receiver != employee:
+                    return None
+            
+            # Toggle vote
+            existing_vote = PollVote.objects.filter(option=option, employee=employee).first()
+            
+            if existing_vote:
+                existing_vote.delete()
+                action = "removed"
+            else:
+                if not poll.allow_multiple:
+                    PollVote.objects.filter(option__poll=poll, employee=employee).delete()
+                PollVote.objects.create(option=option, employee=employee)
+                action = "added"
+            
+            # Build updated options data
+            options_data = []
+            for opt in poll.options.all().order_by('order'):
+                options_data.append({
+                    "id": opt.id,
+                    "text": opt.text,
+                    "votes": opt.votes.count(),
+                    "voters": list(opt.votes.values_list('employee__name', flat=True)),
+                })
+            
+            total_votes = PollVote.objects.filter(option__poll=poll).count()
+            
+            return {
+                "message_id": message.id,
+                "poll_id": poll.id,
+                "voter_id": employee.id,
+                "voter_name": employee.name,
+                "option_id": option_id,
+                "action": action,
+                "pollOptions": options_data,
+                "totalVotes": total_votes,
+            }
+        except Exception as e:
+            logger.exception(f"Poll vote error: {e}")
+            return None
+
+    @database_sync_to_async
+    def get_my_poll_votes(self, poll_id):
+        """Get current employee's votes for a specific poll"""
+        try:
+            employee = Employee.objects.get(id=self.employee_id)
+            poll = Poll.objects.get(id=poll_id)
+            voted_options = PollVote.objects.filter(
+                option__poll=poll, employee=employee
+            ).values_list('option__order', flat=True)
+            return list(voted_options)
+        except Exception:
+            return []
 
 
 class GroupChatConsumer(AsyncWebsocketConsumer):
@@ -274,7 +341,6 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
                 await self.close()
                 return
             
-            # ✅ SECURITY: Drop connection immediately if user is suspended
             if employee.get('is_suspended', False):
                 await self.close()
                 return
@@ -308,6 +374,7 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
             elif msg_type == "typing": await self.handle_typing(data)
             elif msg_type == "edit": await self.handle_edit(data)
             elif msg_type == "delete": await self.handle_delete(data)
+            elif msg_type == "poll_vote": await self.handle_poll_vote(data)
         except Exception: pass
 
     async def handle_message(self, data):
@@ -319,7 +386,7 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
         if result: await self.channel_layer.group_send(self.room_group_name, {"type": "reaction_update", "data": result})
 
     async def handle_typing(self, data):
-        await self.channel_layer.group_send(self.room_group_name, { "type": "typing_indicator", "data": { "sender_id": self.employee_id, "is_typing": data.get("is_typing", False) }})
+        await self.channel_layer.group_send(self.room_group_name, {"type": "typing_indicator", "data": {"sender_id": self.employee_id, "is_typing": data.get("is_typing", False)}})
 
     async def handle_edit(self, data):
         result = await self.edit_message_db(data.get("message_id"), data.get("content", "").strip())
@@ -329,6 +396,12 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
         result = await self.delete_message_db(data.get("message_id"), data.get("delete_type", "for_me"))
         if result: await self.channel_layer.group_send(self.room_group_name, {"type": "message_deleted", "data": result})
 
+    async def handle_poll_vote(self, data):
+        """Handle poll vote via WebSocket in group"""
+        result = await self.save_poll_vote(data.get("poll_id"), data.get("option_id"))
+        if result:
+            await self.channel_layer.group_send(self.room_group_name, {"type": "poll_update", "data": result})
+
     async def chat_message(self, event): await self.send(text_data=json.dumps({"type": "message", "data": event["data"]}))
     async def reaction_update(self, event): await self.send(text_data=json.dumps({"type": "reaction", "data": event["data"]}))
     async def typing_indicator(self, event): 
@@ -336,11 +409,18 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
     async def message_edited(self, event): await self.send(text_data=json.dumps({"type": "edited", "data": event["data"]}))
     async def message_deleted(self, event): await self.send(text_data=json.dumps({"type": "deleted", "data": event["data"]}))
 
+    async def poll_update(self, event):
+        """Send poll update with personalized myVotes"""
+        data = event["data"].copy()
+        my_votes = await self.get_my_poll_votes(data.get("poll_id"))
+        data["myVotes"] = my_votes
+        await self.send(text_data=json.dumps({"type": "poll_update", "data": data}))
+
     @database_sync_to_async
     def get_employee(self, user):
         try:
             employee = Employee.objects.get(user=user, is_active=True)
-            return { 'id': employee.id, 'name': employee.name, 'is_suspended': employee.is_suspended }
+            return {'id': employee.id, 'name': employee.name, 'is_suspended': employee.is_suspended}
         except Employee.DoesNotExist: return None
 
     @database_sync_to_async
@@ -355,7 +435,7 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
     def save_group_message(self, text, message_type='text', reply_to_id=None):
         try:
             sender = Employee.objects.get(id=self.employee_id, is_active=True)
-            if sender.is_suspended: return None # ✅ SECURITY
+            if sender.is_suspended: return None
 
             group = ChatGroup.objects.get(id=self.group_id)
             if group.is_broadcast and not (group.members.filter(id=sender.id).exists() and sender.role in ['admin', 'superadmin']):
@@ -364,17 +444,11 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
             reply_to = None
             reply_to_data = None
             if reply_to_id:
-                # ✅ FIX: React sometimes sends a full object instead of an ID. Extract the ID safely to prevent crashing.
                 if isinstance(reply_to_id, dict):
                     reply_to_id = reply_to_id.get('id')
-                    
                 try: 
                     reply_to = Message.objects.get(id=reply_to_id)
-                    reply_to_data = {
-                        "id": reply_to.id,
-                        "text": reply_to.content[:100] if reply_to.content else "",
-                        "sender_name": reply_to.sender.name
-                    }
+                    reply_to_data = {"id": reply_to.id, "text": reply_to.content[:100] if reply_to.content else "", "sender_name": reply_to.sender.name}
                 except Message.DoesNotExist: pass
             
             msg = Message.objects.create(
@@ -383,11 +457,15 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
             )
             
             return {
-                "id": msg.id, "text": msg.content, "sender_id": sender.id, "sender_name": sender.name,
-                "sender_avatar": sender.get_avatar_url(), "group_id": group.id, "createdAt": msg.timestamp.isoformat(),
-                "messageType": msg.message_type, "reactions": {}, "userReaction": None, "isEdited": False, 
+                "id": msg.id, "text": msg.content,
+                "type": msg.message_type, "messageType": msg.message_type,
+                "sender_id": sender.id, "sender_name": sender.name, "senderName": sender.name,
+                "sender_avatar": sender.get_avatar_url(), "group_id": group.id,
+                "createdAt": msg.timestamp.isoformat(),
+                "reactions": {}, "userReaction": None, "isEdited": False, 
                 "canEdit": True, "canDeleteForEveryone": True, "replyTo": reply_to_data,
-                "isPinned": False, "isStarred": False, "thread": []
+                "isPinned": False, "isStarred": False, "thread": [],
+                "isMine": None,
             }
         except Exception as e: 
             logger.exception(f"Save Group Error: {e}")
@@ -404,7 +482,7 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
             elif reaction is None:
                 MessageReaction.objects.filter(message=message, employee=employee).delete()
             reactions = list(message.reactions.values('reaction').annotate(count=Count('reaction')))
-            return { "message_id": message_id, "reactions": {r['reaction']: r['count'] for r in reactions}, "employee_id": self.employee_id, "reaction": reaction }
+            return {"message_id": message_id, "reactions": {r['reaction']: r['count'] for r in reactions}, "employee_id": self.employee_id, "reaction": reaction}
         except Exception: return None
 
     @database_sync_to_async
@@ -418,7 +496,7 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
             message.is_edited = True
             message.edited_at = timezone.now()
             message.save()
-            return { "message_id": message_id, "content": new_content, "isEdited": True, "editedAt": message.edited_at.isoformat() }
+            return {"message_id": message_id, "content": new_content, "isEdited": True, "editedAt": message.edited_at.isoformat()}
         except Exception: return None
 
     @database_sync_to_async
@@ -433,8 +511,72 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
                 message.content = ""
                 message.save()
                 if message.file: message.file.delete()
-                return { "message_id": message_id, "deletedForEveryone": True }
+                return {"message_id": message_id, "deletedForEveryone": True}
             else:
                 MessageDeletion.objects.get_or_create(message=message, employee=employee)
-                return { "message_id": message_id, "deletedForMe": True }
+                return {"message_id": message_id, "deletedForMe": True}
         except Exception: return None
+
+    @database_sync_to_async
+    def save_poll_vote(self, poll_id, option_id):
+        """Save a poll vote in group context"""
+        try:
+            employee = Employee.objects.get(id=self.employee_id, is_active=True)
+            if employee.is_suspended: return None
+            
+            poll = Poll.objects.get(id=poll_id)
+            option = PollOption.objects.get(id=option_id, poll=poll)
+            message = poll.message
+            
+            if message.group:
+                if employee not in message.group.members.all() and employee.role not in ['admin', 'superadmin']:
+                    return None
+            
+            existing_vote = PollVote.objects.filter(option=option, employee=employee).first()
+            
+            if existing_vote:
+                existing_vote.delete()
+                action = "removed"
+            else:
+                if not poll.allow_multiple:
+                    PollVote.objects.filter(option__poll=poll, employee=employee).delete()
+                PollVote.objects.create(option=option, employee=employee)
+                action = "added"
+            
+            options_data = []
+            for opt in poll.options.all().order_by('order'):
+                options_data.append({
+                    "id": opt.id,
+                    "text": opt.text,
+                    "votes": opt.votes.count(),
+                    "voters": list(opt.votes.values_list('employee__name', flat=True)),
+                })
+            
+            total_votes = PollVote.objects.filter(option__poll=poll).count()
+            
+            return {
+                "message_id": message.id,
+                "poll_id": poll.id,
+                "voter_id": employee.id,
+                "voter_name": employee.name,
+                "option_id": option_id,
+                "action": action,
+                "pollOptions": options_data,
+                "totalVotes": total_votes,
+            }
+        except Exception as e:
+            logger.exception(f"Group poll vote error: {e}")
+            return None
+
+    @database_sync_to_async
+    def get_my_poll_votes(self, poll_id):
+        """Get current employee's votes for a specific poll"""
+        try:
+            employee = Employee.objects.get(id=self.employee_id)
+            poll = Poll.objects.get(id=poll_id)
+            voted_options = PollVote.objects.filter(
+                option__poll=poll, employee=employee
+            ).values_list('option__order', flat=True)
+            return list(voted_options)
+        except Exception:
+            return []

@@ -31,6 +31,11 @@ urlpatterns = [
     path('api/messages/<int:message_id>/delete-for-me/', views.delete_message_for_me, name='delete_message_for_me'),
     path('api/messages/<int:message_id>/delete-for-everyone/', views.delete_message_for_everyone, name='delete_message_for_everyone'),
     
+    # ==================== POLLS ====================
+    path('api/polls/create/', views.create_poll, name='create_poll'),
+    path('api/polls/<int:poll_id>/vote/', views.vote_poll, name='vote_poll'),
+    path('api/polls/<int:poll_id>/results/', views.get_poll_results, name='get_poll_results'),
+    
     # ==================== GROUPS ====================
     path('api/groups/', views.get_groups, name='get_groups'),
     path('api/groups/create/', views.create_group, name='create_group'),
@@ -57,9 +62,10 @@ urlpatterns = [
     path('api/admin/activity-log/', views.admin_get_activity_log, name='admin_get_activity_log'),
     path('api/admin/exit-employee-view/', views.admin_exit_employee_view, name='admin_exit_employee_view'),
     
-path('api/messages/<int:message_id>/star/', views.toggle_message_star, name='toggle_message_star'),
-path('api/messages/<int:message_id>/pin/', views.toggle_message_pin, name='toggle_message_pin'),
-path('api/users/<int:target_id>/block/', views.toggle_block_user, name='toggle_block_user'),
-path('api/messages/forward/', views.forward_messages, name='forward_messages'),
-path('api/admin/employee/<int:employee_id>/delete/', views.admin_delete_employee, name='admin_delete_employee'),
+    # ==================== STAR / PIN / BLOCK / FORWARD / DELETE ====================
+    path('api/messages/<int:message_id>/star/', views.toggle_message_star, name='toggle_message_star'),
+    path('api/messages/<int:message_id>/pin/', views.toggle_message_pin, name='toggle_message_pin'),
+    path('api/users/<int:target_id>/block/', views.toggle_block_user, name='toggle_block_user'),
+    path('api/messages/forward/', views.forward_messages, name='forward_messages'),
+    path('api/admin/employee/<int:employee_id>/delete/', views.admin_delete_employee, name='admin_delete_employee'),
 ]
