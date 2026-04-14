@@ -2490,3 +2490,92 @@ def update_online_status(request):
         return Response({"status": "updated"}, status=200)
     except Employee.DoesNotExist:
         return Response({"error": "Employee not found"}, status=404)
+    
+
+import random
+from django.core.mail import send_mail
+from django.conf import settings
+from django.utils import timezone
+from django.views.decorators.csrf import csrf_exempt
+
+
+from datetime import datetime, timedelta
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def verify_email_exists(request):
+    email = request.data.get("email", "").strip().lower()
+
+    user = Employee.objects.filter(email__iexact=email).first()
+
+    if not user:
+        return Response({"error": "No account found"}, status=404)
+
+    import random
+    otp = str(random.randint(100000, 999999))
+
+    user.otp = otp
+    user.otp_expiry = timezone.now() + timedelta(minutes=5)
+    user.save()
+
+    try:
+        print("EMAIL_HOST:", settings.EMAIL_HOST)
+        print("EMAIL_PORT:", settings.EMAIL_PORT)
+        print("TLS:", settings.EMAIL_USE_TLS)
+        print("SSL:", settings.EMAIL_USE_SSL)
+        send_mail(
+        "Your OTP Code",
+        f"Your OTP is {otp}",
+        settings.EMAIL_HOST_USER,
+        [user.email]
+    )
+    except Exception as e:
+        print("EMAIL ERROR:", str(e))   # 👈 IMPORTANT
+        return Response({
+            "error": "Email failed",
+            "details": str(e)
+        }, status=500)
+
+    return Response({"status": "success", "message": "OTP sent"})
+@csrf_exempt
+@api_view(["PATCH"])
+@permission_classes([AllowAny])
+def reset_password(request):
+    email=request.data.get("email")
+    new_password=request.data.get("new_password")
+
+    if not email or not new_password:
+        return Response({"error": "Missing data"}, status=400)
+
+    try:
+        employee=Employee.objects.get(email=email)
+        employee.password=new_password
+        employee.otp =  None
+        employee.otp_expiry = None
+        employee.save(update_fields=['password','otp','otp_expiry'])
+
+        return Response({"status": "success", "message": "Password updated successfully."})
+    except Employee.DoesNotExist:
+        return Response({"error": "User no longer exists."}, status=404)
+    
+
+from rest_framework.decorators import api_view, permission_classes, authentication_classes
+@csrf_exempt
+@api_view(["POST"])
+@permission_classes([AllowAny])
+@authentication_classes([]) 
+def verify_otp(request):
+    email = request.data.get("email", "").strip().lower()
+    otp = request.data.get("otp", "").strip()
+
+    user = Employee.objects.filter(email__iexact=email).first()
+
+    if not user:
+        return Response({"error": "User not found"}, status=404)
+
+    if user.otp != otp:
+        return Response({"error": "Invalid OTP"}, status=400)
+
+    if timezone.now() > user.otp_expiry:
+        return Response({"error": "OTP expired"}, status=400)
+
+    return Response({"status": "success", "message": "OTP verified"})

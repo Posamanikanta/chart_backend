@@ -33,6 +33,8 @@ class Employee(models.Model):
     
     is_online = models.BooleanField(default=False)
     last_seen = models.DateTimeField(null=True, blank=True)
+    otp = models.CharField(max_length=6,null=True,blank=True)
+    otp_expiry = models.DateTimeField(null=True,blank=True)
 
     def __str__(self):
         return f"{self.name} ({self.email})"

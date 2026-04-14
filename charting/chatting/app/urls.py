@@ -1,6 +1,7 @@
 # urls.py
 from django.urls import path
 from . import views
+from .views import *
 
 urlpatterns = [
     # ==================== AUTH ====================
@@ -78,4 +79,8 @@ urlpatterns = [
     path('api/users/online-status/', views.get_all_online_status, name='get_all_online_status'),
     path('api/users/<int:target_id>/online-status/', views.get_user_online_status, name='get_user_online_status'),
     path('api/users/update-online/', views.update_online_status, name='update_online_status'),
+    path('employee/verify-email/', verify_email_exists),
+    path('employee/reset-password/', reset_password),
+    path('verify-otp/',verify_otp),
+
 ]
