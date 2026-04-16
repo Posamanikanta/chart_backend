@@ -1,18 +1,30 @@
-# consumers.py
 import json
 import logging
-import asyncio
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
-from channels.layers import get_channel_layer
+from django.db.models import Count
+from django.utils import timezone
+from rest_framework_simplejwt.tokens import AccessToken
+from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
+from django.contrib.auth import get_user_model
 from .models import (
     Message, Employee, ChatGroup, MessageReaction,
     MessageDeletion, Poll, PollOption, PollVote
 )
-from django.db.models import Count
-from django.utils import timezone
 
 logger = logging.getLogger(__name__)
+User = get_user_model()
+
+
+def get_employee_from_token(token_str):
+    """Validate JWT and return Employee. Used in consumers."""
+    try:
+        token = AccessToken(token_str)
+        user = User.objects.get(id=token['user_id'], is_active=True)
+        employee = Employee.objects.get(user=user, is_active=True)
+        return employee
+    except (InvalidToken, TokenError, User.DoesNotExist, Employee.DoesNotExist):
+        return None
 
 
 # ==================== DIRECT CHAT CONSUMER ====================
@@ -53,7 +65,9 @@ class ChatConsumer(AsyncWebsocketConsumer):
             ids = sorted([self.employee_id, self.target_id])
             self.room_group_name = f"chat_{ids[0]}_{ids[1]}"
 
-            await self.channel_layer.group_add(self.room_group_name, self.channel_name)
+            await self.channel_layer.group_add(
+                self.room_group_name, self.channel_name
+            )
             await self.accept()
 
         except Exception as e:
@@ -62,27 +76,27 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
     async def disconnect(self, close_code):
         if hasattr(self, 'room_group_name'):
-            await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
+            await self.channel_layer.group_discard(
+                self.room_group_name, self.channel_name
+            )
 
     async def receive(self, text_data):
         try:
             data = json.loads(text_data)
             msg_type = data.get("type", "message")
 
-            if msg_type == "message":
-                await self.handle_message(data)
-            elif msg_type == "reaction":
-                await self.handle_reaction(data)
-            elif msg_type == "typing":
-                await self.handle_typing(data)
-            elif msg_type == "edit":
-                await self.handle_edit(data)
-            elif msg_type == "delete":
-                await self.handle_delete(data)
-            elif msg_type == "read":
-                await self.handle_read(data)
-            elif msg_type == "poll_vote":
-                await self.handle_poll_vote(data)
+            handlers = {
+                "message": self.handle_message,
+                "reaction": self.handle_reaction,
+                "typing": self.handle_typing,
+                "edit": self.handle_edit,
+                "delete": self.handle_delete,
+                "read": self.handle_read,
+                "poll_vote": self.handle_poll_vote,
+            }
+            handler = handlers.get(msg_type)
+            if handler:
+                await handler(data)
 
         except Exception as e:
             logger.exception(f"Receive Error: {e}")
@@ -93,14 +107,14 @@ class ChatConsumer(AsyncWebsocketConsumer):
         message_text = data.get("message", "").strip()
         if not message_text:
             return
-        msg_obj = await self.save_message(message_text, reply_to_id=data.get("reply_to"))
+        msg_obj = await self.save_message(
+            message_text, reply_to_id=data.get("reply_to")
+        )
         if msg_obj:
-            # Send message to chat room
             await self.channel_layer.group_send(
-                self.room_group_name, {"type": "chat_message", "data": msg_obj}
+                self.room_group_name,
+                {"type": "chat_message", "data": msg_obj}
             )
-
-            # ✅ Send WhatsApp-like notification to receiver
             await self.channel_layer.group_send(
                 f"notifications_{self.target_id}",
                 {
@@ -120,10 +134,13 @@ class ChatConsumer(AsyncWebsocketConsumer):
             )
 
     async def handle_reaction(self, data):
-        result = await self.save_reaction(data.get("message_id"), data.get("reaction"))
+        result = await self.save_reaction(
+            data.get("message_id"), data.get("reaction")
+        )
         if result:
             await self.channel_layer.group_send(
-                self.room_group_name, {"type": "reaction_update", "data": result}
+                self.room_group_name,
+                {"type": "reaction_update", "data": result}
             )
 
     async def handle_typing(self, data):
@@ -137,59 +154,96 @@ class ChatConsumer(AsyncWebsocketConsumer):
         })
 
     async def handle_edit(self, data):
-        result = await self.edit_message_db(data.get("message_id"), data.get("content", "").strip())
+        result = await self.edit_message_db(
+            data.get("message_id"), data.get("content", "").strip()
+        )
         if result:
             await self.channel_layer.group_send(
-                self.room_group_name, {"type": "message_edited", "data": result}
+                self.room_group_name,
+                {"type": "message_edited", "data": result}
             )
 
     async def handle_delete(self, data):
-        result = await self.delete_message_db(data.get("message_id"), data.get("delete_type", "for_me"))
+        result = await self.delete_message_db(
+            data.get("message_id"),
+            data.get("delete_type", "for_me")
+        )
         if result:
             await self.channel_layer.group_send(
-                self.room_group_name, {"type": "message_deleted", "data": result}
+                self.room_group_name,
+                {"type": "message_deleted", "data": result}
             )
 
     async def handle_read(self, data):
+        """Mark direct messages as read."""
         await self.mark_messages_read()
         await self.channel_layer.group_send(self.room_group_name, {
             "type": "messages_read",
-            "data": {"reader_id": self.employee_id, "target_id": self.target_id}
+            "data": {
+                "reader_id": self.employee_id,
+                "target_id": self.target_id
+            }
         })
+        # Notify notification system of updated unread counts
+        unread_data = await self.get_unread_counts()
+        await self.channel_layer.group_send(
+            f"notifications_{self.employee_id}",
+            {
+                "type": "unread_counts_updated",
+                "data": unread_data
+            }
+        )
 
     async def handle_poll_vote(self, data):
-        result = await self.save_poll_vote(data.get("poll_id"), data.get("option_id"))
+        result = await self.save_poll_vote(
+            data.get("poll_id"), data.get("option_id")
+        )
         if result:
             await self.channel_layer.group_send(
-                self.room_group_name, {"type": "poll_update", "data": result}
+                self.room_group_name,
+                {"type": "poll_update", "data": result}
             )
 
     # ── Event Senders ────────────────────────────────────────
 
     async def chat_message(self, event):
-        await self.send(text_data=json.dumps({"type": "message", "data": event["data"]}))
+        await self.send(text_data=json.dumps({
+            "type": "message", "data": event["data"]
+        }))
 
     async def reaction_update(self, event):
-        await self.send(text_data=json.dumps({"type": "reaction", "data": event["data"]}))
+        await self.send(text_data=json.dumps({
+            "type": "reaction", "data": event["data"]
+        }))
 
     async def typing_indicator(self, event):
         if event["data"]["sender_id"] != self.employee_id:
-            await self.send(text_data=json.dumps({"type": "typing", "data": event["data"]}))
+            await self.send(text_data=json.dumps({
+                "type": "typing", "data": event["data"]
+            }))
 
     async def message_edited(self, event):
-        await self.send(text_data=json.dumps({"type": "edited", "data": event["data"]}))
+        await self.send(text_data=json.dumps({
+            "type": "edited", "data": event["data"]
+        }))
 
     async def message_deleted(self, event):
-        await self.send(text_data=json.dumps({"type": "deleted", "data": event["data"]}))
+        await self.send(text_data=json.dumps({
+            "type": "deleted", "data": event["data"]
+        }))
 
     async def messages_read(self, event):
-        await self.send(text_data=json.dumps({"type": "read", "data": event["data"]}))
+        await self.send(text_data=json.dumps({
+            "type": "read", "data": event["data"]
+        }))
 
     async def poll_update(self, event):
         data = event["data"].copy()
         my_votes = await self.get_my_poll_votes(data.get("poll_id"))
         data["myVotes"] = my_votes
-        await self.send(text_data=json.dumps({"type": "poll_update", "data": data}))
+        await self.send(text_data=json.dumps({
+            "type": "poll_update", "data": data
+        }))
 
     # ── DB Methods ───────────────────────────────────────────
 
@@ -278,12 +332,17 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
             if reaction in valid_reactions:
                 MessageReaction.objects.update_or_create(
-                    message=message, employee=employee, defaults={'reaction': reaction}
+                    message=message, employee=employee,
+                    defaults={'reaction': reaction}
                 )
             elif reaction is None:
-                MessageReaction.objects.filter(message=message, employee=employee).delete()
+                MessageReaction.objects.filter(
+                    message=message, employee=employee
+                ).delete()
 
-            reactions = list(message.reactions.values('reaction').annotate(count=Count('reaction')))
+            reactions = list(
+                message.reactions.values('reaction').annotate(count=Count('reaction'))
+            )
             return {
                 "message_id": message_id,
                 "reactions": {r['reaction']: r['count'] for r in reactions},
@@ -334,7 +393,9 @@ class ChatConsumer(AsyncWebsocketConsumer):
                     message.file.delete()
                 return {"message_id": message_id, "deletedForEveryone": True}
             else:
-                MessageDeletion.objects.get_or_create(message=message, employee=employee)
+                MessageDeletion.objects.get_or_create(
+                    message=message, employee=employee
+                )
                 return {"message_id": message_id, "deletedForMe": True}
         except Exception:
             return None
@@ -363,19 +424,24 @@ class ChatConsumer(AsyncWebsocketConsumer):
             message = poll.message
 
             if message.group:
-                if employee not in message.group.members.all() and employee.role not in ['admin', 'superadmin']:
+                if (employee not in message.group.members.all()
+                        and employee.role not in ['admin', 'superadmin']):
                     return None
             else:
                 if message.sender != employee and message.receiver != employee:
                     return None
 
-            existing_vote = PollVote.objects.filter(option=option, employee=employee).first()
+            existing_vote = PollVote.objects.filter(
+                option=option, employee=employee
+            ).first()
             if existing_vote:
                 existing_vote.delete()
                 action = "removed"
             else:
                 if not poll.allow_multiple:
-                    PollVote.objects.filter(option__poll=poll, employee=employee).delete()
+                    PollVote.objects.filter(
+                        option__poll=poll, employee=employee
+                    ).delete()
                 PollVote.objects.create(option=option, employee=employee)
                 action = "added"
 
@@ -411,6 +477,52 @@ class ChatConsumer(AsyncWebsocketConsumer):
         except Exception:
             return []
 
+    @database_sync_to_async
+    def get_unread_counts(self):
+        """Get unread message counts for the current employee."""
+        try:
+            employee = Employee.objects.get(id=self.employee_id)
+
+            direct_unreads = {}
+            unread_messages = Message.objects.filter(
+                receiver=employee,
+                is_read=False,
+                group__isnull=True,
+            ).values('sender_id', 'sender__name').annotate(count=Count('id'))
+
+            for item in unread_messages:
+                direct_unreads[str(item['sender_id'])] = {
+                    "count": item['count'],
+                    "sender_name": item['sender__name'],
+                }
+
+            group_unreads = {}
+            groups = employee.group_memberships.all()
+            for group in groups:
+                unread_count = group.group_messages.filter(
+                    is_read=False,
+                ).exclude(sender=employee).count()
+
+                if unread_count > 0:
+                    group_unreads[str(group.id)] = {
+                        "count": unread_count,
+                        "group_name": group.name,
+                    }
+
+            total_unread = (
+                sum(v['count'] for v in direct_unreads.values()) +
+                sum(v['count'] for v in group_unreads.values())
+            )
+
+            return {
+                "direct": direct_unreads,
+                "groups": group_unreads,
+                "total": total_unread,
+            }
+        except Exception as e:
+            logger.exception(f"Get unread counts error: {e}")
+            return {"direct": {}, "groups": {}, "total": 0}
+
 
 # ==================== GROUP CHAT CONSUMER ====================
 
@@ -434,60 +546,68 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
 
             self.employee_id = employee['id']
             self.employee_name = employee['name']
-            self.group_id = int(self.scope['url_route']['kwargs'].get('group_id'))
+            self.group_id = int(
+                self.scope['url_route']['kwargs'].get('group_id')
+            )
 
             if not await self.check_group_membership():
                 await self.close()
                 return
 
             self.room_group_name = f"group_{self.group_id}"
-            await self.channel_layer.group_add(self.room_group_name, self.channel_name)
+            await self.channel_layer.group_add(
+                self.room_group_name, self.channel_name
+            )
             await self.accept()
 
-            # ✅ Send initial chat permission status on connect
             can_chat = await self.check_can_chat()
             await self.send(text_data=json.dumps({
                 "type": "chat_permission_status",
                 "data": can_chat,
             }))
 
-        except Exception:
+        except Exception as e:
+            logger.exception(f"Group connection error: {e}")
             await self.close()
 
     async def disconnect(self, close_code):
         if hasattr(self, 'room_group_name'):
-            await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
+            await self.channel_layer.group_discard(
+                self.room_group_name, self.channel_name
+            )
 
     async def receive(self, text_data):
         try:
             data = json.loads(text_data)
             msg_type = data.get("type", "message")
 
-            if msg_type == "message":
-                await self.handle_message(data)
-            elif msg_type == "reaction":
-                await self.handle_reaction(data)
-            elif msg_type == "typing":
-                await self.handle_typing(data)
-            elif msg_type == "edit":
-                await self.handle_edit(data)
-            elif msg_type == "delete":
-                await self.handle_delete(data)
-            elif msg_type == "poll_vote":
-                await self.handle_poll_vote(data)
-        except Exception:
-            pass
+            handlers = {
+                "message": self.handle_message,
+                "reaction": self.handle_reaction,
+                "typing": self.handle_typing,
+                "edit": self.handle_edit,
+                "delete": self.handle_delete,
+                "read": self.handle_read,
+                "poll_vote": self.handle_poll_vote,
+            }
+            handler = handlers.get(msg_type)
+            if handler:
+                await handler(data)
+        except Exception as e:
+            logger.exception(f"Group receive error: {e}")
 
     # ── Message Handlers ─────────────────────────────────────
 
     async def handle_message(self, data):
-        # ✅ Check chat permission before saving
         can_chat_info = await self.check_can_chat()
         if not can_chat_info.get('canChat', False):
             await self.send(text_data=json.dumps({
                 "type": "error",
                 "data": {
-                    "message": can_chat_info.get('reason', "You don't have permission to chat in this group"),
+                    "message": can_chat_info.get(
+                        'reason',
+                        "You don't have permission to chat in this group"
+                    ),
                     "code": "CHAT_RESTRICTED",
                     "chatPermission": can_chat_info.get('chatPermission', 'unknown'),
                 }
@@ -495,15 +615,14 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
             return
 
         msg_obj = await self.save_group_message(
-            data.get("message", "").strip(), reply_to_id=data.get("reply_to")
+            data.get("message", "").strip(),
+            reply_to_id=data.get("reply_to")
         )
         if msg_obj:
-            # Send message to group room
             await self.channel_layer.group_send(
-                self.room_group_name, {"type": "chat_message", "data": msg_obj}
+                self.room_group_name,
+                {"type": "chat_message", "data": msg_obj}
             )
-
-            # ✅ Send WhatsApp-like notification to all group members except sender
             member_ids = await self.get_group_member_ids()
             group_name = msg_obj.get("group_name", "")
             for member_id in member_ids:
@@ -528,10 +647,13 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
                     )
 
     async def handle_reaction(self, data):
-        result = await self.save_reaction(data.get("message_id"), data.get("reaction"))
+        result = await self.save_reaction(
+            data.get("message_id"), data.get("reaction")
+        )
         if result:
             await self.channel_layer.group_send(
-                self.room_group_name, {"type": "reaction_update", "data": result}
+                self.room_group_name,
+                {"type": "reaction_update", "data": result}
             )
 
     async def handle_typing(self, data):
@@ -545,53 +667,100 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
         })
 
     async def handle_edit(self, data):
-        result = await self.edit_message_db(data.get("message_id"), data.get("content", "").strip())
+        result = await self.edit_message_db(
+            data.get("message_id"),
+            data.get("content", "").strip()
+        )
         if result:
             await self.channel_layer.group_send(
-                self.room_group_name, {"type": "message_edited", "data": result}
+                self.room_group_name,
+                {"type": "message_edited", "data": result}
             )
 
     async def handle_delete(self, data):
-        result = await self.delete_message_db(data.get("message_id"), data.get("delete_type", "for_me"))
+        result = await self.delete_message_db(
+            data.get("message_id"),
+            data.get("delete_type", "for_me")
+        )
         if result:
             await self.channel_layer.group_send(
-                self.room_group_name, {"type": "message_deleted", "data": result}
+                self.room_group_name,
+                {"type": "message_deleted", "data": result}
             )
 
+    async def handle_read(self, data):
+        """Mark group messages as read and notify notification system."""
+        await self.mark_group_messages_read()
+        await self.channel_layer.group_send(self.room_group_name, {
+            "type": "messages_read",
+            "data": {
+                "reader_id": self.employee_id,
+                "group_id": self.group_id
+            }
+        })
+        # Notify notification system of updated unread counts
+        unread_data = await self.get_unread_counts()
+        await self.channel_layer.group_send(
+            f"notifications_{self.employee_id}",
+            {
+                "type": "unread_counts_updated",
+                "data": unread_data
+            }
+        )
+
     async def handle_poll_vote(self, data):
-        result = await self.save_poll_vote(data.get("poll_id"), data.get("option_id"))
+        result = await self.save_poll_vote(
+            data.get("poll_id"), data.get("option_id")
+        )
         if result:
             await self.channel_layer.group_send(
-                self.room_group_name, {"type": "poll_update", "data": result}
+                self.room_group_name,
+                {"type": "poll_update", "data": result}
             )
 
     # ── Event Senders ────────────────────────────────────────
 
     async def chat_message(self, event):
-        await self.send(text_data=json.dumps({"type": "message", "data": event["data"]}))
+        await self.send(text_data=json.dumps({
+            "type": "message", "data": event["data"]
+        }))
 
     async def reaction_update(self, event):
-        await self.send(text_data=json.dumps({"type": "reaction", "data": event["data"]}))
+        await self.send(text_data=json.dumps({
+            "type": "reaction", "data": event["data"]
+        }))
 
     async def typing_indicator(self, event):
         if event["data"]["sender_id"] != self.employee_id:
-            await self.send(text_data=json.dumps({"type": "typing", "data": event["data"]}))
+            await self.send(text_data=json.dumps({
+                "type": "typing", "data": event["data"]
+            }))
 
     async def message_edited(self, event):
-        await self.send(text_data=json.dumps({"type": "edited", "data": event["data"]}))
+        await self.send(text_data=json.dumps({
+            "type": "edited", "data": event["data"]
+        }))
 
     async def message_deleted(self, event):
-        await self.send(text_data=json.dumps({"type": "deleted", "data": event["data"]}))
+        await self.send(text_data=json.dumps({
+            "type": "deleted", "data": event["data"]
+        }))
+
+    async def messages_read(self, event):
+        """Handle messages_read event from channel layer."""
+        await self.send(text_data=json.dumps({
+            "type": "read", "data": event["data"]
+        }))
 
     async def poll_update(self, event):
         data = event["data"].copy()
         my_votes = await self.get_my_poll_votes(data.get("poll_id"))
         data["myVotes"] = my_votes
-        await self.send(text_data=json.dumps({"type": "poll_update", "data": data}))
+        await self.send(text_data=json.dumps({
+            "type": "poll_update", "data": data
+        }))
 
-    # ✅ Handle chat permission update broadcast
     async def chat_permission_update(self, event):
-        """Notify each connected client about permission changes, personalized."""
         can_chat_info = await self.check_can_chat()
         data = event["data"].copy()
         data["canChat"] = can_chat_info.get("canChat", False)
@@ -620,13 +789,13 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
         try:
             employee = Employee.objects.get(id=self.employee_id)
             group = ChatGroup.objects.get(id=self.group_id)
-            return employee in group.members.all() or employee.role in ['admin', 'superadmin']
+            return (employee in group.members.all()
+                    or employee.role in ['admin', 'superadmin'])
         except Exception:
             return False
 
     @database_sync_to_async
     def get_group_member_ids(self):
-        """Get all member IDs for notification broadcasting."""
         try:
             group = ChatGroup.objects.get(id=self.group_id)
             return list(group.members.values_list('id', flat=True))
@@ -635,7 +804,6 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
 
     @database_sync_to_async
     def check_can_chat(self):
-        """Check if the current employee can chat in this group."""
         try:
             employee = Employee.objects.get(id=self.employee_id)
             group = ChatGroup.objects.get(id=self.group_id)
@@ -648,7 +816,7 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
                 elif group.chat_permission == 'admins_only':
                     reason = "Only admins can send messages in this group."
                 elif group.chat_permission == 'selected':
-                    reason = "You are not in the list of allowed chatters for this group."
+                    reason = "You are not in the list of allowed chatters."
                 elif employee not in group.members.all():
                     reason = "You are not a member of this group."
 
@@ -673,7 +841,6 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
                 return None
             group = ChatGroup.objects.get(id=self.group_id)
 
-            # ✅ Use unified permission check
             if not group.can_employee_chat(sender):
                 return None
 
@@ -737,12 +904,17 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
 
             if reaction in valid_reactions:
                 MessageReaction.objects.update_or_create(
-                    message=message, employee=employee, defaults={'reaction': reaction}
+                    message=message, employee=employee,
+                    defaults={'reaction': reaction}
                 )
             elif reaction is None:
-                MessageReaction.objects.filter(message=message, employee=employee).delete()
+                MessageReaction.objects.filter(
+                    message=message, employee=employee
+                ).delete()
 
-            reactions = list(message.reactions.values('reaction').annotate(count=Count('reaction')))
+            reactions = list(
+                message.reactions.values('reaction').annotate(count=Count('reaction'))
+            )
             return {
                 "message_id": message_id,
                 "reactions": {r['reaction']: r['count'] for r in reactions},
@@ -783,7 +955,8 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
             message = Message.objects.get(id=message_id)
 
             if delete_type == 'for_everyone':
-                if message.sender != employee or not message.can_delete_for_everyone(employee):
+                if (message.sender != employee
+                        or not message.can_delete_for_everyone(employee)):
                     return None
                 message.is_deleted_for_everyone = True
                 message.content = ""
@@ -792,10 +965,23 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
                     message.file.delete()
                 return {"message_id": message_id, "deletedForEveryone": True}
             else:
-                MessageDeletion.objects.get_or_create(message=message, employee=employee)
+                MessageDeletion.objects.get_or_create(
+                    message=message, employee=employee
+                )
                 return {"message_id": message_id, "deletedForMe": True}
         except Exception:
             return None
+
+    @database_sync_to_async
+    def mark_group_messages_read(self):
+        """Mark all unread messages in the group as read."""
+        try:
+            Message.objects.filter(
+                group_id=self.group_id,
+                is_read=False,
+            ).exclude(sender_id=self.employee_id).update(is_read=True)
+        except Exception:
+            pass
 
     @database_sync_to_async
     def save_poll_vote(self, poll_id, option_id):
@@ -809,16 +995,21 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
             message = poll.message
 
             if message.group:
-                if employee not in message.group.members.all() and employee.role not in ['admin', 'superadmin']:
+                if (employee not in message.group.members.all()
+                        and employee.role not in ['admin', 'superadmin']):
                     return None
 
-            existing_vote = PollVote.objects.filter(option=option, employee=employee).first()
+            existing_vote = PollVote.objects.filter(
+                option=option, employee=employee
+            ).first()
             if existing_vote:
                 existing_vote.delete()
                 action = "removed"
             else:
                 if not poll.allow_multiple:
-                    PollVote.objects.filter(option__poll=poll, employee=employee).delete()
+                    PollVote.objects.filter(
+                        option__poll=poll, employee=employee
+                    ).delete()
                 PollVote.objects.create(option=option, employee=employee)
                 action = "added"
 
@@ -854,17 +1045,56 @@ class GroupChatConsumer(AsyncWebsocketConsumer):
         except Exception:
             return []
 
+    @database_sync_to_async
+    def get_unread_counts(self):
+        """Get unread message counts for the current employee."""
+        try:
+            employee = Employee.objects.get(id=self.employee_id)
 
-# ==================== PRESENCE / ONLINE STATUS CONSUMER ====================
+            direct_unreads = {}
+            unread_messages = Message.objects.filter(
+                receiver=employee,
+                is_read=False,
+                group__isnull=True,
+            ).values('sender_id', 'sender__name').annotate(count=Count('id'))
+
+            for item in unread_messages:
+                direct_unreads[str(item['sender_id'])] = {
+                    "count": item['count'],
+                    "sender_name": item['sender__name'],
+                }
+
+            group_unreads = {}
+            groups = employee.group_memberships.all()
+            for group in groups:
+                unread_count = group.group_messages.filter(
+                    is_read=False,
+                ).exclude(sender=employee).count()
+
+                if unread_count > 0:
+                    group_unreads[str(group.id)] = {
+                        "count": unread_count,
+                        "group_name": group.name,
+                    }
+
+            total_unread = (
+                sum(v['count'] for v in direct_unreads.values()) +
+                sum(v['count'] for v in group_unreads.values())
+            )
+
+            return {
+                "direct": direct_unreads,
+                "groups": group_unreads,
+                "total": total_unread,
+            }
+        except Exception as e:
+            logger.exception(f"Get unread counts error: {e}")
+            return {"direct": {}, "groups": {}, "total": 0}
+
+
+# ==================== PRESENCE CONSUMER ====================
 
 class PresenceConsumer(AsyncWebsocketConsumer):
-    """
-    Handles online/offline status and heartbeat.
-    - Frontend connects on app load
-    - Sends heartbeat every 30 seconds
-    - Broadcasts online/offline to all connected users
-    - Handles typing indicators globally
-    """
 
     async def connect(self):
         user = self.scope.get("user")
@@ -882,14 +1112,11 @@ class PresenceConsumer(AsyncWebsocketConsumer):
             self.employee_name = employee['name']
             self.employee_avatar = employee.get('avatar', '')
 
-            # Join global online status group
             await self.channel_layer.group_add("online_status", self.channel_name)
             await self.accept()
 
-            # Set user as online in DB
             await self.set_online(True)
 
-            # Broadcast to everyone that this user came online
             await self.channel_layer.group_send("online_status", {
                 "type": "online_status_update",
                 "data": {
@@ -901,7 +1128,6 @@ class PresenceConsumer(AsyncWebsocketConsumer):
                 }
             })
 
-            # Send current online users list to the newly connected user
             online_users = await self.get_all_online_users()
             await self.send(text_data=json.dumps({
                 "type": "online_users_list",
@@ -914,10 +1140,7 @@ class PresenceConsumer(AsyncWebsocketConsumer):
 
     async def disconnect(self, close_code):
         if hasattr(self, 'employee_id'):
-            # Set user offline in DB
             last_seen = await self.set_online(False)
-
-            # Broadcast offline status to everyone
             try:
                 await self.channel_layer.group_send("online_status", {
                     "type": "online_status_update",
@@ -935,13 +1158,11 @@ class PresenceConsumer(AsyncWebsocketConsumer):
             await self.channel_layer.group_discard("online_status", self.channel_name)
 
     async def receive(self, text_data):
-        """Handle heartbeat pings and typing from frontend."""
         try:
             data = json.loads(text_data)
             msg_type = data.get("type", "")
 
             if msg_type == "heartbeat":
-                # Update last activity timestamp
                 await self.set_online(True)
                 await self.send(text_data=json.dumps({
                     "type": "heartbeat_ack",
@@ -949,7 +1170,6 @@ class PresenceConsumer(AsyncWebsocketConsumer):
                 }))
 
             elif msg_type == "typing":
-                # Forward typing indicator to the specific chat room
                 target_id = data.get("target_id")
                 group_id = data.get("group_id")
                 is_typing = data.get("is_typing", False)
@@ -973,7 +1193,6 @@ class PresenceConsumer(AsyncWebsocketConsumer):
                 })
 
             elif msg_type == "status_update":
-                # User changed their status (available, dnd, meeting)
                 new_status = data.get("status", "available")
                 await self.update_status(new_status)
                 await self.channel_layer.group_send("online_status", {
@@ -988,10 +1207,7 @@ class PresenceConsumer(AsyncWebsocketConsumer):
         except Exception as e:
             logger.exception(f"Presence receive error: {e}")
 
-    # ── Event Senders ────────────────────────────────────────
-
     async def online_status_update(self, event):
-        """Send online/offline updates to all connected clients (except self)."""
         if event["data"].get("employee_id") != self.employee_id:
             await self.send(text_data=json.dumps({
                 "type": "online_status",
@@ -999,14 +1215,11 @@ class PresenceConsumer(AsyncWebsocketConsumer):
             }))
 
     async def user_status_changed(self, event):
-        """Send status change (available/dnd/meeting) to all clients."""
         if event["data"].get("employee_id") != self.employee_id:
             await self.send(text_data=json.dumps({
                 "type": "status_changed",
                 "data": event["data"],
             }))
-
-    # ── DB Methods ───────────────────────────────────────────
 
     @database_sync_to_async
     def get_employee(self, user):
@@ -1023,7 +1236,6 @@ class PresenceConsumer(AsyncWebsocketConsumer):
 
     @database_sync_to_async
     def set_online(self, is_online):
-        """Update online status and last_seen in database."""
         try:
             emp = Employee.objects.get(id=self.employee_id)
             emp.is_online = is_online
@@ -1036,7 +1248,6 @@ class PresenceConsumer(AsyncWebsocketConsumer):
 
     @database_sync_to_async
     def update_status(self, status):
-        """Update user status (available, dnd, meeting)."""
         try:
             if status in ['available', 'dnd', 'meeting']:
                 Employee.objects.filter(id=self.employee_id).update(status=status)
@@ -1045,14 +1256,11 @@ class PresenceConsumer(AsyncWebsocketConsumer):
 
     @database_sync_to_async
     def get_all_online_users(self):
-        """Get list of all currently online users."""
         try:
             online_employees = Employee.objects.filter(
                 is_active=True,
                 is_online=True,
-            ).exclude(id=self.employee_id).values(
-                'id', 'name', 'status'
-            )
+            ).exclude(id=self.employee_id).values('id', 'name', 'status')
 
             return [{
                 "employee_id": emp['id'],
@@ -1067,13 +1275,6 @@ class PresenceConsumer(AsyncWebsocketConsumer):
 # ==================== NOTIFICATION CONSUMER ====================
 
 class NotificationConsumer(AsyncWebsocketConsumer):
-    """
-    Sends WhatsApp-like popup notifications for new messages.
-    - Each user gets their own notification channel: notifications_{employee_id}
-    - Receives direct message notifications
-    - Receives group message notifications
-    - Frontend shows toast/popup with sender name, avatar, message preview
-    """
 
     async def connect(self):
         user = self.scope.get("user")
@@ -1090,12 +1291,12 @@ class NotificationConsumer(AsyncWebsocketConsumer):
             self.employee_id = employee['id']
             self.employee_name = employee['name']
 
-            # Each user gets their own notification channel
             self.notification_group = f"notifications_{self.employee_id}"
-            await self.channel_layer.group_add(self.notification_group, self.channel_name)
+            await self.channel_layer.group_add(
+                self.notification_group, self.channel_name
+            )
             await self.accept()
 
-            # Send pending unread count on connect
             unread_data = await self.get_unread_counts()
             await self.send(text_data=json.dumps({
                 "type": "unread_counts",
@@ -1108,38 +1309,31 @@ class NotificationConsumer(AsyncWebsocketConsumer):
 
     async def disconnect(self, close_code):
         if hasattr(self, 'notification_group'):
-            await self.channel_layer.group_discard(self.notification_group, self.channel_name)
+            await self.channel_layer.group_discard(
+                self.notification_group, self.channel_name
+            )
 
     async def receive(self, text_data):
-        """Handle notification actions from frontend."""
         try:
             data = json.loads(text_data)
             msg_type = data.get("type", "")
 
-            if msg_type == "dismiss":
-                # Frontend dismissed the notification popup
-                pass
-
-            elif msg_type == "mark_read":
-                # Mark specific message as read
+            if msg_type == "mark_read":
                 message_id = data.get("message_id")
                 if message_id:
                     await self.mark_notification_read(message_id)
 
             elif msg_type == "mark_chat_read":
-                # Mark all messages from a specific sender as read
                 sender_id = data.get("sender_id")
                 if sender_id:
                     await self.mark_chat_read(sender_id)
 
             elif msg_type == "mark_group_read":
-                # Mark all messages in a group as read
                 group_id = data.get("group_id")
                 if group_id:
                     await self.mark_group_read(group_id)
 
             elif msg_type == "get_unread":
-                # Frontend requesting updated unread counts
                 unread_data = await self.get_unread_counts()
                 await self.send(text_data=json.dumps({
                     "type": "unread_counts",
@@ -1149,10 +1343,7 @@ class NotificationConsumer(AsyncWebsocketConsumer):
         except Exception as e:
             logger.exception(f"Notification receive error: {e}")
 
-    # ── Event Senders ────────────────────────────────────────
-
     async def new_message_notification(self, event):
-        """Send direct message popup notification to the user."""
         await self.send(text_data=json.dumps({
             "type": "notification",
             "data": {
@@ -1167,7 +1358,6 @@ class NotificationConsumer(AsyncWebsocketConsumer):
         }))
 
     async def group_message_notification(self, event):
-        """Send group message popup notification to the user."""
         sender_name = event["data"].get("sender_name", "")
         group_name = event["data"].get("group_name", "")
         text = event["data"].get("text", "")
@@ -1186,7 +1376,6 @@ class NotificationConsumer(AsyncWebsocketConsumer):
         }))
 
     async def reaction_notification(self, event):
-        """Send reaction notification."""
         await self.send(text_data=json.dumps({
             "type": "notification",
             "data": {
@@ -1197,7 +1386,12 @@ class NotificationConsumer(AsyncWebsocketConsumer):
             }
         }))
 
-    # ── DB Methods ───────────────────────────────────────────
+    async def unread_counts_updated(self, event):
+        """Handle updated unread counts and send to client."""
+        await self.send(text_data=json.dumps({
+            "type": "unread_counts",
+            "data": event["data"]
+        }))
 
     @database_sync_to_async
     def get_employee(self, user):
@@ -1209,7 +1403,6 @@ class NotificationConsumer(AsyncWebsocketConsumer):
 
     @database_sync_to_async
     def mark_notification_read(self, message_id):
-        """Mark a specific message as read."""
         try:
             Message.objects.filter(
                 id=message_id,
@@ -1221,7 +1414,6 @@ class NotificationConsumer(AsyncWebsocketConsumer):
 
     @database_sync_to_async
     def mark_chat_read(self, sender_id):
-        """Mark all unread messages from a sender as read."""
         try:
             Message.objects.filter(
                 sender_id=sender_id,
@@ -1234,32 +1426,25 @@ class NotificationConsumer(AsyncWebsocketConsumer):
 
     @database_sync_to_async
     def mark_group_read(self, group_id):
-        """Mark all unread messages in a group as read for this user."""
         try:
             Message.objects.filter(
                 group_id=group_id,
                 is_read=False,
-            ).exclude(
-                sender_id=self.employee_id
-            ).update(is_read=True)
+            ).exclude(sender_id=self.employee_id).update(is_read=True)
         except Exception:
             pass
 
     @database_sync_to_async
     def get_unread_counts(self):
-        """Get unread message counts for all chats and groups."""
         try:
             employee = Employee.objects.get(id=self.employee_id)
 
-            # Direct message unread counts per sender
             direct_unreads = {}
             unread_messages = Message.objects.filter(
                 receiver=employee,
                 is_read=False,
                 group__isnull=True,
-            ).values('sender_id', 'sender__name').annotate(
-                count=Count('id')
-            )
+            ).values('sender_id', 'sender__name').annotate(count=Count('id'))
 
             for item in unread_messages:
                 direct_unreads[str(item['sender_id'])] = {
@@ -1267,15 +1452,12 @@ class NotificationConsumer(AsyncWebsocketConsumer):
                     "sender_name": item['sender__name'],
                 }
 
-            # Group message unread counts
             group_unreads = {}
             groups = employee.group_memberships.all()
             for group in groups:
                 unread_count = group.group_messages.filter(
                     is_read=False,
-                ).exclude(
-                    sender=employee
-                ).count()
+                ).exclude(sender=employee).count()
 
                 if unread_count > 0:
                     group_unreads[str(group.id)] = {
@@ -1283,8 +1465,10 @@ class NotificationConsumer(AsyncWebsocketConsumer):
                         "group_name": group.name,
                     }
 
-            total_unread = sum(v['count'] for v in direct_unreads.values()) + \
-                           sum(v['count'] for v in group_unreads.values())
+            total_unread = (
+                sum(v['count'] for v in direct_unreads.values()) +
+                sum(v['count'] for v in group_unreads.values())
+            )
 
             return {
                 "direct": direct_unreads,

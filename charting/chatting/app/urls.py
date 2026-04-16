@@ -1,12 +1,11 @@
-# urls.py
 from django.urls import path
 from . import views
-from .views import *
 
 urlpatterns = [
     # ==================== AUTH ====================
     path('api/login/', views.login_user, name='login_user'),
     path('api/logout/', views.logout_user, name='logout_user'),
+    path('api/token/refresh/', views.refresh_token, name='refresh_token'),
     path('api/me/', views.get_current_user, name='get_current_user'),
 
     # ==================== USERS ====================
@@ -48,7 +47,7 @@ urlpatterns = [
     path('api/groups/<int:group_id>/update/', views.update_group, name='update_group'),
     path('api/groups/<int:group_id>/leave/', views.leave_group, name='leave_group'),
 
-    # ✅ NEW: Group Chat Permission Endpoints
+    # ==================== CHAT PERMISSIONS ====================
     path('api/groups/<int:group_id>/chat-permission/', views.get_group_chat_permission, name='get_group_chat_permission'),
     path('api/groups/<int:group_id>/chat-permission/update/', views.update_group_chat_permission, name='update_group_chat_permission'),
     path('api/groups/<int:group_id>/chat-permission/check/', views.check_can_chat, name='check_can_chat'),
@@ -76,11 +75,13 @@ urlpatterns = [
     path('api/users/<int:target_id>/block/', views.toggle_block_user, name='toggle_block_user'),
     path('api/messages/forward/', views.forward_messages, name='forward_messages'),
 
+    # ==================== ONLINE STATUS ====================
     path('api/users/online-status/', views.get_all_online_status, name='get_all_online_status'),
     path('api/users/<int:target_id>/online-status/', views.get_user_online_status, name='get_user_online_status'),
     path('api/users/update-online/', views.update_online_status, name='update_online_status'),
-    path('employee/verify-email/', verify_email_exists),
-    path('employee/reset-password/', reset_password),
-    path('verify-otp/',verify_otp),
 
+    # ==================== PASSWORD RESET ====================
+    path('employee/verify-email/', views.verify_email_exists),
+    path('employee/reset-password/', views.reset_password),
+    path('verify-otp/', views.verify_otp),
 ]
